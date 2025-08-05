@@ -1,0 +1,6 @@
+crewai[tools]
+fastapi
+uvicorn[standard]
+python-dotenv
+sec-api
+html2text

@@ -4,3 +4,4 @@ __pycache__
 poetry.lock
 tools/__pycache__
 db
+stock-analysis-env

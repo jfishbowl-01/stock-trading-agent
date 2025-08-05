@@ -2,8 +2,9 @@ from typing import List
 from crewai import Agent, Crew, Process, Task
 from crewai.project import CrewBase, agent, crew, task
 
-from tools.calculator_tool import CalculatorTool
-from tools.sec_tools import SEC10KTool, SEC10QTool
+# Only import SEC tools for now - comment out calculator
+# from .tools.calculator_tool import calculator_tool
+from .tools.sec_tools import SEC10KTool, SEC10QTool
 
 from crewai_tools import WebsiteSearchTool, ScrapeWebsiteTool, TXTSearchTool
 
@@ -27,7 +28,6 @@ class StockAnalysisCrew:
             tools=[
                 ScrapeWebsiteTool(),
                 WebsiteSearchTool(),
-                CalculatorTool(),
                 SEC10QTool("AMZN"),
                 SEC10KTool("AMZN"),
             ]
@@ -49,7 +49,6 @@ class StockAnalysisCrew:
             llm=llm,
             tools=[
                 ScrapeWebsiteTool(),
-                # WebsiteSearchTool(), 
                 SEC10QTool("AMZN"),
                 SEC10KTool("AMZN"),
             ]
@@ -71,7 +70,6 @@ class StockAnalysisCrew:
             tools=[
                 ScrapeWebsiteTool(),
                 WebsiteSearchTool(),
-                CalculatorTool(),
                 SEC10QTool(),
                 SEC10KTool(),
             ]
@@ -100,7 +98,6 @@ class StockAnalysisCrew:
             tools=[
                 ScrapeWebsiteTool(),
                 WebsiteSearchTool(),
-                CalculatorTool(),
             ]
         )
 

@@ -1,6 +1,6 @@
 import os
 from typing import Any, Optional, Type
-from pydantic.v1 import BaseModel, Field
+from pydantic import BaseModel, Field
 from crewai_tools import RagTool
 from sec_api import QueryApi  # Make sure to have sec_api installed
 from embedchain.models.data_type import DataType
@@ -13,12 +13,15 @@ class FixedSEC10KToolSchema(BaseModel):
     search_query: str = Field(
         ...,
         description="Mandatory query you would like to search from the 10-K report",
+        json_schema_extra={"required": True}
     )
 
 class SEC10KToolSchema(FixedSEC10KToolSchema):
     """Input for SEC10KTool."""
     stock_name: str = Field(
-        ..., description="Mandatory valid stock name you would like to search"
+        ..., 
+        description="Mandatory valid stock name you would like to search",
+        json_schema_extra={"required": True}
     )
 
 class SEC10KTool(RagTool):
@@ -94,12 +97,15 @@ class FixedSEC10QToolSchema(BaseModel):
     search_query: str = Field(
         ...,
         description="Mandatory query you would like to search from the 10-Q report",
+        json_schema_extra={"required": True}
     )
 
 class SEC10QToolSchema(FixedSEC10QToolSchema):
     """Input for SEC10QTool."""
     stock_name: str = Field(
-        ..., description="Mandatory valid stock name you would like to search"
+        ..., 
+        description="Mandatory valid stock name you would like to search",
+        json_schema_extra={"required": True}
     )
 
 class SEC10QTool(RagTool):
@@ -167,4 +173,3 @@ class SEC10QTool(RagTool):
 
     def _run(self, search_query: str, **kwargs: Any) -> Any:
         return super()._run(query=search_query, **kwargs)
-
