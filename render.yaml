@@ -1,4 +1,3 @@
-
 services:
   - type: web
     name: stock-analysis-api
@@ -9,13 +8,13 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.0
-      - key: SERPER_API_KEY
-        sync: false
-      - key: BROWSERLESS_API_KEY
+      - key: OPENAI_API_KEY
         sync: false
       - key: SEC_API_API_KEY
         sync: false
-      - key: OPENAI_API_KEY
+      - key: SERPER_API_KEY
+        sync: false
+      - key: BROWSERLESS_API_KEY
         sync: false
     autoDeploy: true
     healthCheckPath: /health
