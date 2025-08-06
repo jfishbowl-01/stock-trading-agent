@@ -11,8 +11,15 @@ from crewai_tools import WebsiteSearchTool, ScrapeWebsiteTool, TXTSearchTool
 from dotenv import load_dotenv
 load_dotenv()
 
-from langchain.llms import Ollama
-llm = Ollama(model="llama3.1")
+# Switch from Ollama to OpenAI
+from langchain_openai import ChatOpenAI
+
+# Use GPT-4o-mini for good performance at reasonable cost
+# You can also use "gpt-4o" or "gpt-3.5-turbo"
+llm = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0.1,  # Lower temperature for more consistent analysis
+)
 
 @CrewBase
 class StockAnalysisCrew:

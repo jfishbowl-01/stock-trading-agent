@@ -1,16 +1,39 @@
 [tool.poetry]
 name = "stock_analysis"
 version = "0.1.0"
-description = ""
+description = "AI-powered stock analysis using CrewAI"
 authors = ["Your Name <you@example.com>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = ">=3.12,<=3.13"
+python = ">=3.11,<3.13"
+
+# Core FastAPI
+fastapi = "^0.104.0"
+uvicorn = {extras = ["standard"], version = "^0.24.0"}
+python-dotenv = "^1.0.0"
+pydantic = "^2.4.0"
+
+# CrewAI and AI tools
 crewai = {extras = ["tools"], version = "^0.130.0"}
-python-dotenv = "^1.0.1"
-html2text = "^2024.2.26"
-sec-api = "^1.0.20"
+crewai-tools = "^0.47.0"
+
+# LangChain with OpenAI
+langchain-openai = "^0.1.0"
+langchain-community = "^0.0.20"
+langchain-core = "^0.1.0"
+
+# SEC API and web scraping
+sec-api = "^1.0.0"
+html2text = "^2020.1.16"
+requests = "^2.31.0"
+beautifulsoup4 = "^4.12.0"
+lxml = "^4.9.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.0"
+black = "^23.0.0"
+isort = "^5.12.0"
 
 [tool.poetry.scripts]
 stock_analysis = "stock_analysis.main:run"
