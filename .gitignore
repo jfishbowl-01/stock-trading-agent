@@ -4,5 +4,9 @@ __pycache__
 poetry.lock
 tools/__pycache__
 db
+
+#virtual enviornments
 stock-analysis-env
 fresh-test
+1pmtestenv
+test-updated-requirements
