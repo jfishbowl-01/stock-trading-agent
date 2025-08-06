@@ -3,7 +3,11 @@ services:
     name: stock-analysis-api
     env: python
     plan: starter
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt --no-cache-dir
+    buildCommand: |
+      pip install --upgrade pip
+      pip install fastapi uvicorn[standard] python-dotenv
+      pip install "crewai[tools]==0.130.0"
+      pip install langchain-openai sec-api html2text beautifulsoup4 lxml
     startCommand: python app.py
     envVars:
       - key: PYTHON_VERSION
