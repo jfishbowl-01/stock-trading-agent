@@ -20,7 +20,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Enable CORS for Watson X Orchestra integration
+# Enable CORS for watsonx Orchestrate integration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Configure this properly for production
