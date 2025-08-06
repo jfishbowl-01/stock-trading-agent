@@ -5,3 +5,5 @@ poetry.lock
 tools/__pycache__
 db
 stock-analysis-env
+11am_pythonv-test
+11am-test-env
