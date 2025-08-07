@@ -1,9 +1,9 @@
-# Simple requirements.txt - let pip handle dependencies
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-python-dotenv==1.0.0
+fastapi>=0.104.1
+uvicorn[standard]>=0.24.0
+python-dotenv>=1.0.0
 crewai[tools]==0.130.0
-sec-api==1.0.14
+langchain-openai>=0.1.25
+sec-api>=1.0.14
 html2text
 beautifulsoup4
 lxml
