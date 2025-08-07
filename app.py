@@ -507,7 +507,7 @@ async def chat_completions(request: ChatCompletionRequest, background_tasks: Bac
             logger.info("📡 Returning streaming response for Watson X")
             return StreamingResponse(
                 stream_analysis_progress(job_id),
-                media_type="text/plain",
+                media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
