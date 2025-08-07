@@ -314,8 +314,9 @@ async def stream_analysis_progress(job_id: str):
             "finish_reason": None
         }]
     }
+    logger.info("🚀 Sending initial chunk to Orchestrate...")
     yield f"data: {json.dumps(initial_chunk)}\n\n"
-    await asyncio.sleep(1)
+    await asyncio.sleep(0.1)  # Flush fast  
     
     # Monitor job progress and send periodic updates
     start_time = datetime.now().timestamp()
@@ -572,7 +573,7 @@ async def chat_completions(request: ChatCompletionRequest, background_tasks: Bac
                 yield f"data: {json.dumps(error_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
             
-            return StreamingResponse(error_stream(), media_type="text/plain")
+            return StreamingResponse(error_stream(), media_type="text/event-stream")
         else:
             return error_response
 
