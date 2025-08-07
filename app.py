@@ -296,10 +296,11 @@ COMPREHENSIVE STOCK ANALYSIS REQUEST FOR: {stock_symbol}
 async def stream_analysis_progress(job_id: str):
     """
     Stream analysis progress to Watson X Orchestrate using Server-Sent Events (SSE)
-    This provides real-time updates during the long-running CrewAI analysis
+    Provides real-time updates and a heartbeat timeout if the task never starts.
     """
-    
-    # Send initial response chunk
+    logger.info(f"🚦 [stream_analysis_progress] Streaming started for Job ID: {job_id}")
+
+    # === 1. Initial Response ===
     initial_chunk = {
         "id": f"chatcmpl-{job_id}",
         "object": "chat.completion.chunk",
@@ -316,28 +317,51 @@ async def stream_analysis_progress(job_id: str):
     }
     logger.info("🚀 Sending initial chunk to Orchestrate...")
     yield f"data: {json.dumps(initial_chunk)}\n\n"
-    await asyncio.sleep(0.1)  # Flush fast  
-    
-    # Monitor job progress and send periodic updates
+    await asyncio.sleep(0.1)
+
+    # === 2. Stream Progress ===
     start_time = datetime.now().timestamp()
-    timeout = 1200  # 20 minutes timeout for thorough analysis
+    timeout = 1200  # 20 min
     last_status = None
     update_counter = 0
-    
+    heartbeat_start = datetime.now().timestamp()
+    heartbeat_timeout = 15  # seconds
+
     while datetime.now().timestamp() - start_time < timeout:
         job = job_status.get(job_id, {})
         current_status = job.get("status", "unknown")
-        
-        # Send status change updates
+
+        # === 3. Heartbeat: Fail if task never starts ===
+        if last_status is None and current_status == "queued":
+            if datetime.now().timestamp() - heartbeat_start > heartbeat_timeout:
+                logger.warning(f"❌ [Heartbeat Timeout] Job {job_id} stuck in 'queued'")
+                error_chunk = {
+                    "id": f"chatcmpl-{job_id}",
+                    "object": "chat.completion.chunk",
+                    "created": int(datetime.now().timestamp()),
+                    "model": "stock-analysis-agent",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": "❌ **Error:** The analysis process never started. Please try again later.\n"},
+                        "finish_reason": "stop"
+                    }]
+                }
+                yield f"data: {json.dumps(error_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+        # === 4. Status Updates ===
         if current_status != last_status:
+            logger.info(f"🔄 Status update: {last_status} → {current_status}")
+
             status_messages = {
                 "queued": "📋 **Analysis Queued** - Waiting for available AI agents...",
                 "running": "🤖 **Analysis Running** - AI agents researching SEC filings, market data, and news...",
                 "processing": "📊 **Data Processing** - Financial analysts synthesizing findings...",
             }
-            
+
             if current_status in status_messages:
-                status_chunk = {
+                chunk = {
                     "id": f"chatcmpl-{job_id}",
                     "object": "chat.completion.chunk",
                     "created": int(datetime.now().timestamp()),
@@ -348,15 +372,16 @@ async def stream_analysis_progress(job_id: str):
                         "finish_reason": None
                     }]
                 }
-                yield f"data: {json.dumps(status_chunk)}\n\n"
+                yield f"data: {json.dumps(chunk)}\n\n"
                 last_status = current_status
-        
-        # Send periodic keepalive updates
+
+        # === 5. Keepalive Update ===
         update_counter += 1
-        if update_counter % 24 == 0:  # Every 2 minutes (5s * 24)
-            elapsed_minutes = int((datetime.now().timestamp() - start_time) // 60)
-            elapsed_seconds = int((datetime.now().timestamp() - start_time) % 60)
-            
+        if update_counter % 24 == 0:
+            elapsed = datetime.now().timestamp() - start_time
+            minutes = int(elapsed // 60)
+            seconds = int(elapsed % 60)
+
             keepalive_chunk = {
                 "id": f"chatcmpl-{job_id}",
                 "object": "chat.completion.chunk",
@@ -365,27 +390,27 @@ async def stream_analysis_progress(job_id: str):
                 "choices": [{
                     "index": 0,
                     "delta": {
-                        "content": f"⏱️ **Progress Update** - Analysis in progress... ({elapsed_minutes}m {elapsed_seconds}s elapsed)\n"
+                        "content": f"⏱️ **Progress Update** - Analysis in progress... ({minutes}m {seconds}s elapsed)\n"
                     },
                     "finish_reason": None
                 }]
             }
+            logger.info(f"📤 Sending keepalive (elapsed {minutes}m {seconds}s)")
             yield f"data: {json.dumps(keepalive_chunk)}\n\n"
-        
-        # Check if analysis completed
+
+        # === 6. Check for Completion ===
         if current_status in ["completed", "failed"]:
+            logger.info(f"📍 Final job status detected: {current_status}")
             break
-            
-        await asyncio.sleep(2)  # Check every 5 seconds
-    
-    # Send final result
+
+        await asyncio.sleep(2)
+
+    # === 7. Final Result ===
     job = job_status.get(job_id, {})
     final_status = job.get("status", "unknown")
-    
+
     if final_status == "completed":
         result = job.get("result", "Analysis completed but result not available.")
-        
-        # Format the final result nicely
         final_content = f"""
 ## 📈 **Stock Analysis Complete**
 
@@ -396,8 +421,6 @@ async def stream_analysis_progress(job_id: str):
 - **Job ID**: {job_id}
 - **Analysis Time**: {int((datetime.now().timestamp() - start_time) // 60)} minutes
 - **Completed**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
-
-*This analysis is for informational purposes only. Please consult with a qualified financial advisor before making investment decisions.*
 """
     else:
         error_msg = job.get("error", "Analysis timeout or unknown error occurred")
@@ -413,9 +436,9 @@ Unfortunately, the stock analysis could not be completed:
 2. Try again in a few minutes (temporary service issues)
 3. Contact support if the problem persists
 
-**Job ID**: {job_id} (for support reference)
+**Job ID**: {job_id}
 """
-    
+
     final_chunk = {
         "id": f"chatcmpl-{job_id}",
         "object": "chat.completion.chunk",
@@ -427,10 +450,12 @@ Unfortunately, the stock analysis could not be completed:
             "finish_reason": "stop"
         }]
     }
+    logger.info("✅ Sending final result chunk")
     yield f"data: {json.dumps(final_chunk)}\n\n"
-    
-    # Send the required [DONE] marker
+
+    logger.info("📤 Sending [DONE] marker")
     yield "data: [DONE]\n\n"
+
 
 # === EXISTING FUNCTION (Keep unchanged) ===
 async def run_stock_analysis(job_id: str, company_stock: str, query: str):
