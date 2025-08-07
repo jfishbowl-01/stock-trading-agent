@@ -376,7 +376,7 @@ async def stream_analysis_progress(job_id: str):
         if current_status in ["completed", "failed"]:
             break
             
-        await asyncio.sleep(5)  # Check every 5 seconds
+        await asyncio.sleep(2)  # Check every 5 seconds
     
     # Send final result
     job = job_status.get(job_id, {})
@@ -438,6 +438,8 @@ async def run_stock_analysis(job_id: str, company_stock: str, query: str):
     try:
         logger.info(f"Starting analysis for {company_stock} (Job: {job_id})")
         job_status[job_id]["status"] = "running"
+        await asyncio.sleep(2)  # short pause to simulate staged status update
+        job_status[job_id]["status"] = "processing"     
         
         # Prepare inputs for the crew
         inputs = {
