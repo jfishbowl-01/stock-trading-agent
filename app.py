@@ -61,8 +61,8 @@ async def run_stock_analysis(job_id: str, company_stock: str, query: str):
             'company_stock': company_stock.upper(),
         }
         
-        # Run the crew analysis
-        crew = StockAnalysisCrew()
+        # Initialize crew with the specific stock symbol
+        crew = StockAnalysisCrew(stock_symbol=company_stock.upper())
         result = crew.crew().kickoff(inputs=inputs)
         
         # Update job status with result
@@ -189,7 +189,8 @@ async def analyze_stock_sync(request: StockAnalysisRequest):
             'company_stock': request.company_stock.upper(),
         }
         
-        crew = StockAnalysisCrew()
+        # Initialize crew with the specific stock symbol
+        crew = StockAnalysisCrew(stock_symbol=request.company_stock.upper())
         result = crew.crew().kickoff(inputs=inputs)
         
         return {

@@ -2,23 +2,18 @@ from typing import List
 from crewai import Agent, Crew, Process, Task
 from crewai.project import CrewBase, agent, crew, task
 
-# Only import SEC tools for now - comment out calculator
-# from .tools.calculator_tool import calculator_tool
 from .tools.sec_tools import SEC10KTool, SEC10QTool
-
-from crewai_tools import WebsiteSearchTool, ScrapeWebsiteTool, TXTSearchTool
+from crewai_tools import WebsiteSearchTool, ScrapeWebsiteTool
 
 from dotenv import load_dotenv
 load_dotenv()
 
-# Switch from Ollama to OpenAI
 from langchain_openai import ChatOpenAI
 
 # Use GPT-4o-mini for good performance at reasonable cost
-# You can also use "gpt-4o" or "gpt-3.5-turbo"
 llm = ChatOpenAI(
     model="gpt-4o-mini",
-    temperature=0.1,  # Lower temperature for more consistent analysis
+    temperature=0.1,
 )
 
 @CrewBase
@@ -26,47 +21,9 @@ class StockAnalysisCrew:
     agents_config = 'config/agents.yaml'
     tasks_config = 'config/tasks.yaml'
     
-    @agent
-    def financial_agent(self) -> Agent:
-        return Agent(
-            config=self.agents_config['financial_analyst'],
-            verbose=True,
-            llm=llm,
-            tools=[
-                ScrapeWebsiteTool(),
-                WebsiteSearchTool(),
-                SEC10QTool("AMZN"),
-                SEC10KTool("AMZN"),
-            ]
-        )
-    
-    @task
-    def financial_analysis(self) -> Task: 
-        return Task(
-            config=self.tasks_config['financial_analysis'],
-            agent=self.financial_agent(),
-        )
-    
-
-    @agent
-    def research_analyst_agent(self) -> Agent:
-        return Agent(
-            config=self.agents_config['research_analyst'],
-            verbose=True,
-            llm=llm,
-            tools=[
-                ScrapeWebsiteTool(),
-                SEC10QTool("AMZN"),
-                SEC10KTool("AMZN"),
-            ]
-        )
-    
-    @task
-    def research(self) -> Task:
-        return Task(
-            config=self.tasks_config['research'],
-            agent=self.research_analyst_agent(),
-        )
+    def __init__(self, stock_symbol: str = "AMZN"):
+        super().__init__()  # Call CrewBase.__init__() with no additional args
+        self.stock_symbol = stock_symbol.upper()
     
     @agent
     def financial_analyst_agent(self) -> Agent:
@@ -77,23 +34,23 @@ class StockAnalysisCrew:
             tools=[
                 ScrapeWebsiteTool(),
                 WebsiteSearchTool(),
-                SEC10QTool(),
-                SEC10KTool(),
+                SEC10QTool(self.stock_symbol),
+                SEC10KTool(self.stock_symbol),
             ]
         )
     
-    @task
-    def financial_analysis(self) -> Task: 
-        return Task(
-            config=self.tasks_config['financial_analysis'],
-            agent=self.financial_analyst_agent(),
-        )
-    
-    @task
-    def filings_analysis(self) -> Task:
-        return Task(
-            config=self.tasks_config['filings_analysis'],
-            agent=self.financial_analyst_agent(),
+    @agent
+    def research_analyst_agent(self) -> Agent:
+        return Agent(
+            config=self.agents_config['research_analyst'],
+            verbose=True,
+            llm=llm,
+            tools=[
+                ScrapeWebsiteTool(),
+                WebsiteSearchTool(),
+                SEC10QTool(self.stock_symbol),
+                SEC10KTool(self.stock_symbol),
+            ]
         )
 
     @agent
@@ -107,6 +64,27 @@ class StockAnalysisCrew:
                 WebsiteSearchTool(),
             ]
         )
+    
+    @task
+    def financial_analysis(self) -> Task: 
+        return Task(
+            config=self.tasks_config['financial_analysis'],
+            agent=self.financial_analyst_agent(),
+        )
+    
+    @task
+    def research(self) -> Task:
+        return Task(
+            config=self.tasks_config['research'],
+            agent=self.research_analyst_agent(),
+        )
+    
+    @task
+    def filings_analysis(self) -> Task:
+        return Task(
+            config=self.tasks_config['filings_analysis'],
+            agent=self.financial_analyst_agent(),
+        )
 
     @task
     def recommend(self) -> Task:
@@ -115,10 +93,9 @@ class StockAnalysisCrew:
             agent=self.investment_advisor_agent(),
         )
     
-    
     @crew
     def crew(self) -> Crew:
-        """Creates the Stock Analysis"""
+        """Creates the Stock Analysis crew"""
         return Crew(
             agents=self.agents,  
             tasks=self.tasks, 
