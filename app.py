@@ -459,6 +459,10 @@ Unfortunately, the stock analysis could not be completed:
 
 # === EXISTING FUNCTION (Keep unchanged) ===
 async def run_stock_analysis(job_id: str, company_stock: str, query: str):
+
+    logger.info(f"🏁 Background job started for {company_stock} (Job ID: {job_id})")
+
+
     """Background task to run stock analysis"""
     try:
         logger.info(f"Starting analysis for {company_stock} (Job: {job_id})")
