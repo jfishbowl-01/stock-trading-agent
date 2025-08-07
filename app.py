@@ -457,40 +457,45 @@ Unfortunately, the stock analysis could not be completed:
     yield "data: [DONE]\n\n"
 
 
-# === EXISTING FUNCTION (Keep unchanged) ===
+# === EXISTING FUNCTION (updated properly) ===
 async def run_stock_analysis(job_id: str, company_stock: str, query: str):
+    """Background task to run stock analysis"""
 
     logger.info(f"🏁 Background job started for {company_stock} (Job ID: {job_id})")
 
-
-    """Background task to run stock analysis"""
     try:
-        logger.info(f"Starting analysis for {company_stock} (Job: {job_id})")
+        logger.info(f"🔧 Starting analysis for {company_stock} (Job: {job_id})")
         job_status[job_id]["status"] = "running"
-        await asyncio.sleep(2)  # short pause to simulate staged status update
-        job_status[job_id]["status"] = "processing"     
-        
+        await asyncio.sleep(2)
+        job_status[job_id]["status"] = "processing"
+
         # Prepare inputs for the crew
         inputs = {
             'query': query,
             'company_stock': company_stock.upper(),
         }
-        
+
         # Initialize crew with the specific stock symbol
         crew = StockAnalysisCrew(stock_symbol=company_stock.upper())
+
         result = crew.crew().kickoff(inputs=inputs)
-        
-        # Update job status with result
+        logger.info(f"🧠 Raw CrewAI result for {company_stock}: {result}")
+
+        # Check if final answer was returned properly
+        if not result or "Final Answer" not in str(result):
+            logger.warning("⚠️ CrewAI did not produce a final answer.")
+            result = "⚠️ No final answer detected. Crew may have exited early or failed to complete."
+
         job_status[job_id].update({
             "status": "completed",
             "result": str(result),
             "completed_at": datetime.now().isoformat()
         })
-        
-        logger.info(f"Analysis completed for {company_stock} (Job: {job_id})")
-        
+
+        logger.info(f"✅ Job marked as completed for {company_stock} (Job ID: {job_id})")
+
     except Exception as e:
-        logger.error(f"Analysis failed for {company_stock} (Job: {job_id}): {str(e)}")
+        logger.error(f"❌ Crew execution failed for {company_stock} (Job ID: {job_id}): {str(e)}")
         job_status[job_id].update({
             "status": "failed",
             "error": str(e),
