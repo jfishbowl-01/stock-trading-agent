@@ -12,3 +12,4 @@ fresh-test
 test-updated-requirements
 pythonv_env
 new_venv
+.venv

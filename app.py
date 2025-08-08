@@ -10,6 +10,7 @@ import asyncio
 import re
 from datetime import datetime
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 # Import your crew
 from src.stock_analysis.crew import StockAnalysisCrew
@@ -310,12 +311,11 @@ async def stream_analysis_progress(job_id: str):
             "index": 0,
             "delta": {
                 "role": "assistant",
-                "content": "🔍 **Initiating Comprehensive Stock Analysis**\n\nStarting multi-agent CrewAI analysis...\n\n"
+                "content": "📡 **Analysis Starting... Please hold on while we prepare the report.\n\n"
             },
             "finish_reason": None
         }]
     }
-    logger.info("🚀 Sending initial chunk to Orchestrate...")
     yield f"data: {json.dumps(initial_chunk)}\n\n"
     await asyncio.sleep(0.1)
 
@@ -459,26 +459,19 @@ Unfortunately, the stock analysis could not be completed:
 
 # === EXISTING FUNCTION (updated properly) ===
 async def run_stock_analysis(job_id: str, company_stock: str, query: str):
-    """Background task to run stock analysis"""
-
     logger.info(f"🏁 Background job started for {company_stock} (Job ID: {job_id})")
-
     try:
-        logger.info(f"🔧 Starting analysis for {company_stock} (Job: {job_id})")
         job_status[job_id]["status"] = "running"
-        await asyncio.sleep(2)
+        await asyncio.sleep(0)  # allow event loop to tick
         job_status[job_id]["status"] = "processing"
 
-        # Prepare inputs for the crew
-        inputs = {
-            'query': query,
-            'company_stock': company_stock.upper(),
-        }
-
-        # Initialize crew with the specific stock symbol
+        inputs = {'query': query, 'company_stock': company_stock.upper()}
         crew = StockAnalysisCrew(stock_symbol=company_stock.upper())
 
-        result = crew.crew().kickoff(inputs=inputs)
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor() as pool:
+            result = await loop.run_in_executor(pool, lambda: crew.crew().kickoff(inputs=inputs))
+
         logger.info(f"🧠 Raw CrewAI result for {company_stock}: {result}")
 
         # Check if final answer was returned properly
