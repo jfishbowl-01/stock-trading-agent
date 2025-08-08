@@ -7,3 +7,5 @@ sec-api>=1.0.14
 html2text
 beautifulsoup4
 lxml
+celery>=5.3
+redis>=4.6
