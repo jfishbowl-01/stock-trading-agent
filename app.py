@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -10,9 +10,7 @@ import asyncio
 import re
 from datetime import datetime
 import uuid
-# We intentionally avoid importing ThreadPoolExecutor here. Instead, we leverage
-# asyncio.to_thread for running blocking calls on a separate thread with a
-# timeout. ThreadPoolExecutor is not used in this version.
+from concurrent.futures import ThreadPoolExecutor
 
 # Import your crew
 from src.stock_analysis.crew import StockAnalysisCrew
@@ -151,9 +149,7 @@ def extract_stock_and_query(messages: List[ChatMessage]) -> tuple[str, str]:
             'exxon': 'XOM', 'chevron': 'CVX', 'conocophillips': 'COP',
             
             # Popular meme/growth stocks
-            'gamestop': 'GME', 'amc': 'AMC', 'palantir': 'PLTR', 'zoom': 'ZM',
-            # Additional mappings for frequently asked tickers
-            'ibm': 'IBM'
+            'gamestop': 'GME', 'amc': 'AMC', 'palantir': 'PLTR', 'zoom': 'ZM'
         }
         
         user_query_lower = user_query.lower()
@@ -463,78 +459,36 @@ Unfortunately, the stock analysis could not be completed:
 
 # === EXISTING FUNCTION (updated properly) ===
 async def run_stock_analysis(job_id: str, company_stock: str, query: str):
-    """
-    Background task to run stock analysis with timeout and robust error handling.
-
-    This implementation runs the blocking CrewAI analysis in a separate thread and
-    imposes a timeout so that long-running or stuck analyses do not hang forever.
-    It updates the job_status dictionary with either a completed result or a
-    failed status and error message.
-    """
     logger.info(f"🏁 Background job started for {company_stock} (Job ID: {job_id})")
     try:
-        # Mark the job as running and then processing
         job_status[job_id]["status"] = "running"
         await asyncio.sleep(0)  # allow event loop to tick
         job_status[job_id]["status"] = "processing"
 
-        # Prepare inputs and crew instance
         inputs = {'query': query, 'company_stock': company_stock.upper()}
         crew = StockAnalysisCrew(stock_symbol=company_stock.upper())
-        crew_instance = crew.crew()
 
-        # Define a timeout (in seconds) for the analysis to complete.
-        # If the analysis takes longer than this, it will be marked as failed.
-        timeout_seconds = int(os.environ.get("ANALYSIS_TIMEOUT", "600"))
-
-        try:
-            # Run the blocking kickoff in a background thread with a timeout.
-            result = await asyncio.wait_for(
-                asyncio.to_thread(lambda: crew_instance.kickoff(inputs=inputs)),
-                timeout=timeout_seconds
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"⏳ Analysis timed out after {timeout_seconds} seconds for {company_stock}")
-            job_status[job_id].update({
-                "status": "failed",
-                "error": f"Analysis timed out after {timeout_seconds} seconds",
-                "completed_at": datetime.now().isoformat()
-            })
-            return
-        except Exception as e:
-            logger.error(f"❌ Crew execution failed during kickoff for {company_stock} (Job ID: {job_id}): {str(e)}")
-            job_status[job_id].update({
-                "status": "failed",
-                "error": str(e),
-                "completed_at": datetime.now().isoformat()
-            })
-            return
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor() as pool:
+            result = await loop.run_in_executor(pool, lambda: crew.crew().kickoff(inputs=inputs))
 
         logger.info(f"🧠 Raw CrewAI result for {company_stock}: {result}")
 
-        # Prepare the result for storage.  If the crew returned nothing, record an empty string.
-        # Do not override the result if it lacks a 'Final Answer' marker; instead, log a warning
-        # but still use the string representation of the result as the final output.  This prevents
-        # partial analyses from being discarded and ensures the completed job has some content.
-        if not result:
-            logger.warning("⚠️ CrewAI returned no result for this analysis.")
-            final_str = ""
-        else:
-            final_str = str(result)
-            if "Final Answer" not in final_str:
-                logger.warning("⚠️ CrewAI did not produce a clearly marked final answer. Using the raw output.")
+        # Check if final answer was returned properly
+        if not result or "Final Answer" not in str(result):
+            logger.warning("⚠️ CrewAI did not produce a final answer.")
+            result = "⚠️ No final answer detected. Crew may have exited early or failed to complete."
 
-        # Mark the job as completed with the final string
         job_status[job_id].update({
             "status": "completed",
-            "result": final_str,
+            "result": str(result),
             "completed_at": datetime.now().isoformat()
         })
+
         logger.info(f"✅ Job marked as completed for {company_stock} (Job ID: {job_id})")
 
     except Exception as e:
-        # Catch any unexpected errors and mark the job as failed
-        logger.error(f"🔥 Unhandled error in run_stock_analysis for {company_stock} (Job ID: {job_id}): {str(e)}")
+        logger.error(f"❌ Crew execution failed for {company_stock} (Job ID: {job_id}): {str(e)}")
         job_status[job_id].update({
             "status": "failed",
             "error": str(e),
@@ -544,7 +498,7 @@ async def run_stock_analysis(job_id: str, company_stock: str, query: str):
 # === NEW WATSON X ORCHESTRATE ENDPOINT ===
 
 @app.post("/chat/completions")
-async def chat_completions(request: ChatCompletionRequest, background_tasks: BackgroundTasks):
+async def chat_completions(request: Request, background_tasks: BackgroundTasks):
     """
     Watson X Orchestrate A2A-compatible chat completions endpoint
     
