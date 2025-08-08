@@ -512,16 +512,22 @@ async def run_stock_analysis(job_id: str, company_stock: str, query: str):
 
         logger.info(f"🧠 Raw CrewAI result for {company_stock}: {result}")
 
-        # If the result doesn't contain a Final Answer marker, provide a fallback notice.
-        if not result or "Final Answer" not in str(result):
-            logger.warning("⚠️ CrewAI did not produce a final answer.")
-            result = ("⚠️ No final answer detected. "
-                      "The analysis may have exited early or returned an intermediate result.")
+        # Prepare the result for storage.  If the crew returned nothing, record an empty string.
+        # Do not override the result if it lacks a 'Final Answer' marker; instead, log a warning
+        # but still use the string representation of the result as the final output.  This prevents
+        # partial analyses from being discarded and ensures the completed job has some content.
+        if not result:
+            logger.warning("⚠️ CrewAI returned no result for this analysis.")
+            final_str = ""
+        else:
+            final_str = str(result)
+            if "Final Answer" not in final_str:
+                logger.warning("⚠️ CrewAI did not produce a clearly marked final answer. Using the raw output.")
 
-        # Mark the job as completed with the result
+        # Mark the job as completed with the final string
         job_status[job_id].update({
             "status": "completed",
-            "result": str(result),
+            "result": final_str,
             "completed_at": datetime.now().isoformat()
         })
         logger.info(f"✅ Job marked as completed for {company_stock} (Job ID: {job_id})")
