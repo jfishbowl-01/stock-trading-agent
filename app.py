@@ -3,6 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
+from collections import defaultdict
+import httpx
 import logging
 import os
 import json
@@ -36,13 +38,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory storage for job status (use Redis in production)
+ # In-memory storage for job status (use Redis in production)
 job_status = {}
+
+# Simple in-memory cache: {key: {"expires": epoch_seconds, "result": str}}
+RESULT_CACHE: Dict[str, Dict[str, Any]] = {}
+CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "21600"))  # 6 hours default
 
 # === EXISTING MODELS (Keep unchanged) ===
 class StockAnalysisRequest(BaseModel):
     company_stock: str
     query: Optional[str] = "Analyze this company's stock performance and investment potential"
+    callback_url: Optional[str] = None
 
 class StockAnalysisResponse(BaseModel):
     job_id: str
@@ -56,6 +63,7 @@ class JobStatusResponse(BaseModel):
     error: Optional[str] = None
     created_at: str
     completed_at: Optional[str] = None
+    callback_url: Optional[str] = None
 
 # === NEW WATSON X ORCHESTRATE MODELS ===
 class ChatMessage(BaseModel):
@@ -69,6 +77,7 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = Field(False, description="Whether to stream the response")
     max_tokens: Optional[int] = Field(None, description="Maximum tokens to generate")
     temperature: Optional[float] = Field(0.1, description="Sampling temperature")
+    callback_url: Optional[str] = Field(None, description="Optional webhook to POST final result when ready")
 
 class ChatCompletionResponse(BaseModel):
     id: str
@@ -298,6 +307,18 @@ COMPREHENSIVE STOCK ANALYSIS REQUEST FOR: {stock_symbol}
     logger.info(f"🚀 Created enhanced query for {stock_symbol} with focus: {analysis_focus}")
     return stock_symbol, enhanced_query.strip()
 
+def _cache_key(ticker: str, query: str) -> str:
+    # cache by ticker + calendar day to avoid stale data; shorten the query fingerprint
+    day = datetime.utcnow().strftime("%Y-%m-%d")
+    return f"{ticker.upper()}:{day}:{hash(query) % 10_000_000}"
+
+async def _post_callback(url: str, payload: Dict[str, Any]) -> None:
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            await client.post(url, json=payload)
+    except Exception as e:
+        logger.warning(f"Callback POST failed to {url}: {e}")
+
 async def stream_analysis_progress(job_id: str):
     """
     Stream analysis progress to Watson X Orchestrate using Server-Sent Events (SSE)
@@ -443,6 +464,21 @@ Unfortunately, the stock analysis could not be completed:
 **Job ID**: {job_id}
 """
 
+    final_payload = {
+        "job_id": job_id,
+        "status": final_status,
+        "result": job.get("result"),
+        "error": job.get("error"),
+        "company_stock": job.get("company_stock"),
+        "created_at": job.get("created_at"),
+        "completed_at": job.get("completed_at")
+    }
+    cb_url = job.get("callback_url")
+    if cb_url:
+        logger.info(f"📬 Posting final result to callback: {cb_url}")
+        # fire-and-forget; do not block stream completion
+        asyncio.create_task(_post_callback(cb_url, final_payload))
+
     final_chunk = {
         "id": f"chatcmpl-{job_id}",
         "object": "chat.completion.chunk",
@@ -473,6 +509,30 @@ async def run_stock_analysis(job_id: str, company_stock: str, query: str):
     """
     logger.info(f"🏁 Background job started for {company_stock} (Job ID: {job_id})")
     try:
+        # Check cache first
+        key = _cache_key(company_stock, query)
+        cached = RESULT_CACHE.get(key)
+        now_ts = datetime.now().timestamp()
+        if cached and cached.get("expires", 0) > now_ts:
+            logger.info(f"🗃️ Cache hit for {company_stock}; returning cached result")
+            job_status[job_id].update({
+                "status": "completed",
+                "result": cached.get("result", ""),
+                "completed_at": datetime.now().isoformat()
+            })
+            # Optionally send callback immediately if present
+            cb_url = job_status[job_id].get("callback_url")
+            if cb_url:
+                asyncio.create_task(_post_callback(cb_url, {
+                    "job_id": job_id,
+                    "status": "completed",
+                    "result": cached.get("result", ""),
+                    "company_stock": company_stock,
+                    "created_at": job_status[job_id]["created_at"],
+                    "completed_at": job_status[job_id]["completed_at"]
+                }))
+            return
+
         # Mark the job as running and then processing
         job_status[job_id]["status"] = "running"
         await asyncio.sleep(0)  # allow event loop to tick
@@ -500,6 +560,16 @@ async def run_stock_analysis(job_id: str, company_stock: str, query: str):
                 "error": f"Analysis timed out after {timeout_seconds} seconds",
                 "completed_at": datetime.now().isoformat()
             })
+            cb_url = job_status[job_id].get("callback_url")
+            if cb_url:
+                asyncio.create_task(_post_callback(cb_url, {
+                    "job_id": job_id,
+                    "status": "failed",
+                    "error": f"Analysis timed out after {timeout_seconds} seconds",
+                    "company_stock": company_stock,
+                    "created_at": job_status[job_id]["created_at"],
+                    "completed_at": job_status[job_id]["completed_at"]
+                }))
             return
         except Exception as e:
             logger.error(f"❌ Crew execution failed during kickoff for {company_stock} (Job ID: {job_id}): {str(e)}")
@@ -508,6 +578,16 @@ async def run_stock_analysis(job_id: str, company_stock: str, query: str):
                 "error": str(e),
                 "completed_at": datetime.now().isoformat()
             })
+            cb_url = job_status[job_id].get("callback_url")
+            if cb_url:
+                asyncio.create_task(_post_callback(cb_url, {
+                    "job_id": job_id,
+                    "status": "failed",
+                    "error": str(e),
+                    "company_stock": company_stock,
+                    "created_at": job_status[job_id]["created_at"],
+                    "completed_at": job_status[job_id]["completed_at"]
+                }))
             return
 
         logger.info(f"🧠 Raw CrewAI result for {company_stock}: {result}")
@@ -524,6 +604,9 @@ async def run_stock_analysis(job_id: str, company_stock: str, query: str):
             if "Final Answer" not in final_str:
                 logger.warning("⚠️ CrewAI did not produce a clearly marked final answer. Using the raw output.")
 
+        # Store in cache
+        RESULT_CACHE[key] = {"result": final_str, "expires": datetime.now().timestamp() + CACHE_TTL_SECONDS}
+
         # Mark the job as completed with the final string
         job_status[job_id].update({
             "status": "completed",
@@ -531,6 +614,16 @@ async def run_stock_analysis(job_id: str, company_stock: str, query: str):
             "completed_at": datetime.now().isoformat()
         })
         logger.info(f"✅ Job marked as completed for {company_stock} (Job ID: {job_id})")
+        cb_url = job_status[job_id].get("callback_url")
+        if cb_url:
+            asyncio.create_task(_post_callback(cb_url, {
+                "job_id": job_id,
+                "status": "completed",
+                "result": final_str,
+                "company_stock": company_stock,
+                "created_at": job_status[job_id]["created_at"],
+                "completed_at": job_status[job_id]["completed_at"]
+            }))
 
     except Exception as e:
         # Catch any unexpected errors and mark the job as failed
@@ -540,6 +633,16 @@ async def run_stock_analysis(job_id: str, company_stock: str, query: str):
             "error": str(e),
             "completed_at": datetime.now().isoformat()
         })
+        cb_url = job_status[job_id].get("callback_url")
+        if cb_url:
+            asyncio.create_task(_post_callback(cb_url, {
+                "job_id": job_id,
+                "status": "failed",
+                "error": str(e),
+                "company_stock": company_stock,
+                "created_at": job_status[job_id]["created_at"],
+                "completed_at": job_status[job_id]["completed_at"]
+            }))
 
 # === NEW WATSON X ORCHESTRATE ENDPOINT ===
 
@@ -570,7 +673,8 @@ async def chat_completions(request: ChatCompletionRequest, background_tasks: Bac
             "created_at": datetime.now().isoformat(),
             "result": None,
             "error": None,
-            "completed_at": None
+            "completed_at": None,
+            "callback_url": request.callback_url,
         }
         
         # Start background analysis using existing function
@@ -593,6 +697,9 @@ async def chat_completions(request: ChatCompletionRequest, background_tasks: Bac
         else:
             # Non-streaming response (for testing or backup)
             logger.info("📄 Returning non-streaming response")
+            note = ""
+            if request.callback_url:
+                note = f"\n\nA callback will POST the final result to: {request.callback_url}"
             return ChatCompletionResponse(
                 id=f"chatcmpl-{job_id}",
                 created=int(datetime.now().timestamp()),
@@ -601,7 +708,7 @@ async def chat_completions(request: ChatCompletionRequest, background_tasks: Bac
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": f"🔍 **Stock Analysis Initiated for {stock_symbol}**\n\nI'm conducting a comprehensive analysis including:\n- SEC filings research\n- Financial metrics analysis\n- Market sentiment review\n- Investment recommendation\n\nThis typically takes 5-15 minutes. The complete analysis will be delivered when ready.\n\n*Job Reference: {job_id}*"
+                        "content": f"🔍 **Stock Analysis Initiated for {stock_symbol}**\n\nI'm conducting a comprehensive analysis including:\n- SEC filings research\n- Financial metrics analysis\n- Market sentiment review\n- Investment recommendation\n\nThis typically takes 5-15 minutes. The complete analysis will be delivered when ready.\n\n*Job Reference: {job_id}*{note}"
                     },
                     "finish_reason": "stop"
                 }],
@@ -723,7 +830,8 @@ async def analyze_stock(
             "created_at": datetime.now().isoformat(),
             "result": None,
             "error": None,
-            "completed_at": None
+            "completed_at": None,
+            "callback_url": request.callback_url,
         }
         
         # Start background task
@@ -802,4 +910,4 @@ async def analyze_stock_sync(request: StockAnalysisRequest):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info", access_log=True)
