@@ -58,13 +58,13 @@ def _http_get(url: str, *, timeout: int = 20, retries: int = 2) -> requests.Resp
             return resp
         except Exception as e:
             last_err = e
-            # simple backoff: 0s, 2s, 4s...
-            time.sleep(2 ** attempt)
-    raise last_err  # bubble up after retries
+            time.sleep(2 ** attempt)  # 0s, 2s, 4s
+    raise last_err
 
 
 def _clean_text(text: str) -> str:
-    # Keep letters, numbers, $, whitespace, and newlines. Drop weird control chars.
+    # Keep printable ASCII; drop weird control chars.
+    text = text.replace("\r", "")
     return re.sub(r"[^\x09\x0A\x0D\x20-\x7E]", "", text)
 
 
@@ -103,7 +103,6 @@ def _fetch_latest_filing_text(form: str, ticker: str) -> str:
         text = resp.text
     elif html_url:
         resp = _http_get(html_url, timeout=25, retries=2)
-        # Convert HTML → text
         try:
             text = _HTML2TEXT.handle(resp.content.decode("utf-8", errors="ignore"))
         except Exception:
@@ -139,14 +138,17 @@ class _BaseSECSnippetTool(RagTool):
     - Agents should call with ONLY: {'search_query': '...'}
     """
 
-    # simple per-instance circuit breaker
+    # Declare as model fields so Pydantic allows access/assignment
+    form: str = "10-K"
+    ticker: Optional[str] = None
     _failures: int = 0
     _fail_limit: int = int(os.getenv("SEC_TOOL_FAIL_LIMIT", "3"))
 
     def __init__(self, ticker: Optional[str] = None, form: str = "10-K", **kwargs):
-        super().__init__(**kwargs)
+        # set declared fields before super().__init__ to avoid validation errors
         self.form = form
         self.ticker = (ticker or "").upper()
+        super().__init__(**kwargs)
 
         # Load & index filing text once at tool creation
         if self.ticker:
@@ -200,9 +202,7 @@ class _BaseSECSnippetTool(RagTool):
             return f"Temporarily disabled after {self._failures} failures. Consider alternative sources."
 
         try:
-            # If RagTool retrieval is configured, let it handle vector search
-            # via super()._run(query=...). If that fails or returns nothing,
-            # fall back to quick keyword windowing using the cached filing text.
+            # Try RagTool vector retrieval first
             try:
                 result = super()._run(query=search_query, **kwargs)
                 if isinstance(result, str) and result.strip():
@@ -211,7 +211,7 @@ class _BaseSECSnippetTool(RagTool):
                 # ignore and fallback
                 pass
 
-            # Fallback: use our cached filing text (from memo or re-fetch)
+            # Fallback: use cached filing text
             text = _memo_get(f"{self.form}:{self.ticker}")
             if not text:
                 text = _fetch_latest_filing_text(self.form, self.ticker)
