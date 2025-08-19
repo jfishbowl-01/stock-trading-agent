@@ -5,7 +5,7 @@ import time
 from typing import Any, Optional, Type, Dict
 
 import requests
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 from crewai_tools import RagTool
 from sec_api import QueryApi
 from embedchain.models.data_type import DataType
@@ -138,27 +138,29 @@ class _BaseSECSnippetTool(RagTool):
     - Agents should call with ONLY: {'search_query': '...'}
     """
 
-    # Declare as model fields so Pydantic allows access/assignment
-    form: str = "10-K"
-    ticker: Optional[str] = None
-    _failures: int = 0
-    _fail_limit: int = int(os.getenv("SEC_TOOL_FAIL_LIMIT", "3"))
+    # Private runtime state (Pydantic-safe)
+    _form: str = PrivateAttr(default="10-K")
+    _ticker: Optional[str] = PrivateAttr(default=None)
+    _failures: int = PrivateAttr(default=0)
+    _fail_limit: int = PrivateAttr(default=int(os.getenv("SEC_TOOL_FAIL_LIMIT", "3")))
 
-    def __init__(self, ticker: Optional[str] = None, form: str = "10-K", **kwargs):
-        # set declared fields before super().__init__ to avoid validation errors
-        self.form = form
-        self.ticker = (ticker or "").upper()
-        super().__init__(**kwargs)
+    def __init__(self, *args, ticker: Optional[str] = None, form: str = "10-K", **kwargs):
+        # Let Pydantic/RagTool init first
+        super().__init__(*args, **kwargs)
+
+        # Now set private runtime state
+        self._form = form
+        self._ticker = (ticker or "").upper()
 
         # Load & index filing text once at tool creation
-        if self.ticker:
+        if self._ticker:
             try:
-                filing_text = _fetch_latest_filing_text(self.form, self.ticker)
+                filing_text = _fetch_latest_filing_text(self._form, self._ticker)
                 # Index into RagTool’s store (mark as TEXT)
                 self.add(filing_text)
                 # Make the description precise for the current ticker/form
                 self.description = (
-                    f"Search the latest {self.form} (SEC filing) text for {self.ticker}. "
+                    f"Search the latest {self._form} (SEC filing) text for {self._ticker}. "
                     f"Pass only {{'search_query': '...'}} at runtime."
                 )
                 # Runtime schema is ONLY search_query
@@ -168,7 +170,7 @@ class _BaseSECSnippetTool(RagTool):
                 # Keep tool alive but note failure; agent can still proceed with other tools
                 self._failures += 1
                 self.description = (
-                    f"Latest {self.form} text for {self.ticker} could not be loaded "
+                    f"Latest {self._form} text for {self._ticker} could not be loaded "
                     f"(reason: {e}). Tool will return a clear error string."
                 )
                 self.args_schema = _SearchSchema
@@ -212,9 +214,9 @@ class _BaseSECSnippetTool(RagTool):
                 pass
 
             # Fallback: use cached filing text
-            text = _memo_get(f"{self.form}:{self.ticker}")
+            text = _memo_get(f"{self._form}:{self._ticker}")
             if not text:
-                text = _fetch_latest_filing_text(self.form, self.ticker)
+                text = _fetch_latest_filing_text(self._form, self._ticker)
             return self._keyword_windows(text, search_query)
 
         except Exception as e:
