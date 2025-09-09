@@ -122,111 +122,52 @@ async def _post_callback(url: str, payload: Dict[str, Any], attempts: int = 3, t
     logger.error(f"🚨 Callback failed after {attempts} attempts to {url}: {last_err}")
 
 def extract_stock_and_query(messages: List[ChatMessage]) -> tuple[str, str]:
-    """Extract ticker + build an enhanced analysis prompt for CrewAI."""
+    """Extract ticker and create a simple analysis query."""
     user_messages = [m for m in messages if m.role == "user"]
-    user_query = user_messages[-1].content.strip() if user_messages else " ".join(m.content for m in messages)
+    user_query = user_messages[-1].content.strip() if user_messages else ""
     logger.info(f"🔍 Processing Watson X message: '{user_query}'")
 
     stock_symbol = None
+    
+    # Simplified ticker extraction - just the essential patterns
     ticker_patterns = [
-        r'\$([A-Z]{1,5})\b',
-        r'\b([A-Z]{2,5})\s+(?:stock|shares|equity)\b',
-        r'(?:ticker|symbol)[\s:]+([A-Z]{1,5})\b',
-        r'(?:analyze|analysis)\s+([A-Z]{2,5})\b',
-        r'\b([A-Z]{2,5})\s+(?:investment|company)\b',
+        r'\$([A-Z]{1,5})\b',           # $AAPL
+        r'\b([A-Z]{2,5})\b',           # GOOG, MSFT, etc.
     ]
+    
     for pattern in ticker_patterns:
         matches = re.findall(pattern, user_query, re.IGNORECASE)
         if matches:
-            bad = {'THE','AND','FOR','YOU','ARE','CAN','GET','ALL','NEW','NOW','WAY','MAY','SEE','HIM','TWO','HOW','ITS','WHO','OIL','TOP','WIN','BUY','USE'}
-            valid = [m.upper() for m in matches if len(m) >= 2 and m.upper() not in bad]
+            # Filter out common words that aren't stock tickers
+            bad_words = {'THE','AND','FOR','YOU','ARE','CAN','GET','ALL','NEW','NOW','WAY','MAY','SEE','HIM','TWO','HOW','ITS','WHO','OIL','TOP','WIN','BUY','USE'}
+            valid = [m.upper() for m in matches if len(m) >= 2 and m.upper() not in bad_words]
             if valid:
-                stock_symbol = valid[0]; break
+                stock_symbol = valid[0]
+                break
 
+    # Company name mapping - simplified list
     if not stock_symbol:
         mapping = {
-            'apple':'AAPL','microsoft':'MSFT','alphabet':'GOOGL','google':'GOOGL','amazon':'AMZN','meta':'META',
-            'facebook':'META','tesla':'TSLA','nvidia':'NVDA','netflix':'NFLX','adobe':'ADBE','salesforce':'CRM',
-            'oracle':'ORCL','intel':'INTC','amd':'AMD','qualcomm':'QCOM','jpmorgan':'JPM','jp morgan':'JPM',
-            'bank of america':'BAC','goldman sachs':'GS','morgan stanley':'MS','wells fargo':'WFC','citigroup':'C',
-            'american express':'AXP','johnson & johnson':'JNJ','pfizer':'PFE','abbvie':'ABBV','merck':'MRK',
-            'eli lilly':'LLY','bristol myers':'BMY','walmart':'WMT','target':'TGT','costco':'COST','home depot':'HD',
-            'mcdonalds':'MCD','coca cola':'KO','pepsi':'PEP','nike':'NKE','exxon':'XOM','chevron':'CVX','conocophillips':'COP',
-            'gamestop':'GME','amc':'AMC','palantir':'PLTR','zoom':'ZM','ibm':'IBM'
+            'apple': 'AAPL', 'microsoft': 'MSFT', 'google': 'GOOGL', 'alphabet': 'GOOGL',
+            'amazon': 'AMZN', 'meta': 'META', 'facebook': 'META', 'tesla': 'TSLA',
+            'nvidia': 'NVDA', 'netflix': 'NFLX', 'adobe': 'ADBE'
         }
-        ql = user_query.lower()
-        for k,v in mapping.items():
-            if k in ql:
-                stock_symbol = v; break
+        query_lower = user_query.lower()
+        for company_name, ticker in mapping.items():
+            if company_name in query_lower:
+                stock_symbol = ticker
+                break
 
-    if not stock_symbol:
-        fallback = [m for m in re.findall(r'\b([A-Z]{2,5})\b', user_query) if m not in {'THE','AND','FOR','YOU','ARE','CAN','GET'}]
-        if fallback:
-            stock_symbol = fallback[0]
-
+    # Default fallback
     if not stock_symbol:
         stock_symbol = "AAPL"
         logger.warning(f"❌ No stock symbol found, defaulting to: {stock_symbol}")
 
-    query_lower = user_query.lower()
-    if any(w in query_lower for w in ['buy','sell','invest','purchase','recommend']):
-        analysis_focus = "INVESTMENT_DECISION"
-        focus_instruction = """
-**PRIMARY FOCUS: INVESTMENT DECISION**
-- Provide BUY/SELL/HOLD with confidence
-- Entry/targets/stop-loss; risk-reward and sizing
-- Compare to alternatives
-"""
-    elif any(w in query_lower for w in ['risk','volatility','safe','dangerous','beta']):
-        analysis_focus = "RISK_ASSESSMENT"
-        focus_instruction = """
-**PRIMARY FOCUS: RISK ANALYSIS**
-- Business/financial/market/regulatory risks
-- Volatility/beta; downside scenarios
-- Mitigation/hedging
-"""
-    elif any(w in query_lower for w in ['earnings','revenue','profit','financial','metrics']):
-        analysis_focus = "FINANCIAL_ANALYSIS"
-        focus_instruction = """
-**PRIMARY FOCUS: FINANCIAL DEEP DIVE**
-- FS/ratios/trends; peer benchmarking
-- Guidance/forward-looking metrics
-"""
-    elif any(w in query_lower for w in ['news','recent','latest','current','sentiment']):
-        analysis_focus = "MARKET_RESEARCH"
-        focus_instruction = """
-**PRIMARY FOCUS: MARKET RESEARCH & SENTIMENT**
-- Latest news/sentiment; analysts changes
-- Upcoming catalysts
-"""
-    else:
-        analysis_focus = "COMPREHENSIVE"
-        focus_instruction = """
-**PRIMARY FOCUS: COMPREHENSIVE ANALYSIS**
-- Balanced view across fundamentals, market, qualitative factors
-"""
-
-    enhanced_query = f"""
-COMPREHENSIVE STOCK ANALYSIS REQUEST FOR: {stock_symbol}
-
-{focus_instruction}
-
-**REQUIRED ANALYSIS COMPONENTS:**
-1) Executive summary + clear recommendation
-2) Financials (P/E, EPS growth, revenue, margins, D/E) with filings
-3) Competitive/market position
-4) Sentiment/news/catalysts
-5) Forward-looking (earnings, initiatives)
-6) Risks (business/financial/market/regulatory)
-7) Final recommendation with rationale
-
-**ORIGINAL USER QUESTION:** "{user_query}"
-**ANALYSIS FOCUS:** {analysis_focus}
-- Use most recent verifiable data.
-- Prefer concise, structured output.
-"""
-    logger.info(f"🚀 Created enhanced query for {stock_symbol} with focus: {analysis_focus}")
-    return stock_symbol, enhanced_query.strip()
+    # Simple query - this is the key change
+    simple_query = f"Analyze {stock_symbol} stock and provide investment recommendation"
+    
+    logger.info(f"🚀 Created simple query for {stock_symbol}: {simple_query}")
+    return stock_symbol, simple_query
 
 # ------------------------------------------------------------------------------
 # Streaming (SSE)
