@@ -1,5 +1,5 @@
 # app.py
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -41,6 +41,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ------------------------------------------------------------------------------
+# Feature flags for sync override
+# ------------------------------------------------------------------------------
+FORCE_SYNC_FOR_UA_SUBSTR = os.getenv("FORCE_SYNC_FOR_UA_SUBSTR", "")  # e.g., "watsonx-orchestrate"
+ALLOW_HEADER_FORCE_SYNC = os.getenv("ALLOW_HEADER_FORCE_SYNC", "1") == "1"
 
 # ------------------------------------------------------------------------------
 # In-memory job store & cache (use Redis in prod)
@@ -403,13 +409,51 @@ async def run_stock_analysis(job_id: str, company_stock: str, query: str):
             }))
 
 # ------------------------------------------------------------------------------
-# /chat/completions (Watsonx-compatible)
+# Helpers: sync and enqueue paths for chat
 # ------------------------------------------------------------------------------
-@app.post("/chat/completions")
-async def chat_completions(request: ChatCompletionRequest, background_tasks: BackgroundTasks):
+async def process_immediately(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Synchronous processing path for chat payloads."""
     try:
-        logger.info(f"🎯 Watson X chat called with {len(request.messages)} messages (stream={request.stream})")
-        stock_symbol, enhanced_query = extract_stock_and_query(request.messages)
+        messages = payload.get("messages", [])
+        if not messages:
+            raise ValueError("Missing 'messages' in payload")
+
+        stock_symbol, enhanced_query = extract_stock_and_query([ChatMessage(**m) for m in messages])
+        inputs = {'query': enhanced_query, 'company_stock': stock_symbol.upper()}
+        crew = StockAnalysisCrew(stock_symbol=stock_symbol.upper())
+        # Run the crew in a thread to avoid blocking event loop
+        result = await asyncio.to_thread(lambda: crew.crew().kickoff(inputs=inputs))
+
+        final_str = str(result) if result else ""
+        response = {
+            "id": f"chatcmpl-{uuid.uuid4()}",
+            "object": "chat.completion",
+            "created": int(datetime.now().timestamp()),
+            "model": payload.get("model", "stock-analysis-agent"),
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": final_str},
+                "finish_reason": "stop"
+            }],
+            "usage": None,
+            "_meta": {"mode": "sync"}
+        }
+        return response
+    except Exception as e:
+        logger.error(f"❌ Sync processing failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Sync processing failed: {e}")
+
+
+async def enqueue_job(payload: Dict[str, Any], background_tasks: BackgroundTasks):
+    """Async queue submission using existing background task model."""
+    try:
+        messages = payload.get("messages", [])
+        if not messages:
+            raise ValueError("Missing 'messages' in payload")
+
+        stream = bool(payload.get("stream", False))
+        callback_url = payload.get("callback_url")
+        stock_symbol, enhanced_query = extract_stock_and_query([ChatMessage(**m) for m in messages])
 
         job_id = str(uuid.uuid4())
         job_status[job_id] = {
@@ -421,24 +465,24 @@ async def chat_completions(request: ChatCompletionRequest, background_tasks: Bac
             "result": None,
             "error": None,
             "completed_at": None,
-            "callback_url": request.callback_url,
+            "callback_url": callback_url,
         }
 
         background_tasks.add_task(run_stock_analysis, job_id, stock_symbol, enhanced_query)
         logger.info(f"✅ Started Watson X analysis for {stock_symbol} (Job: {job_id})")
 
-        if request.stream:
+        if stream:
             return StreamingResponse(
                 stream_analysis_progress(job_id),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
             )
         else:
-            note = f"\n\nA callback will POST the final result to: {request.callback_url}" if request.callback_url else ""
+            note = f"\n\nA callback will POST the final result to: {callback_url}" if callback_url else ""
             return ChatCompletionResponse(
                 id=f"chatcmpl-{job_id}",
                 created=int(datetime.now().timestamp()),
-                model="stock-analysis-agent",
+                model=payload.get("model", "stock-analysis-agent"),
                 choices=[{
                     "index": 0,
                     "message": {
@@ -452,19 +496,68 @@ async def chat_completions(request: ChatCompletionRequest, background_tasks: Bac
                     "finish_reason": "stop"
                 }],
                 usage={
-                    "prompt_tokens": sum(len(m.content.split()) for m in request.messages),
+                    "prompt_tokens": sum(len(ChatMessage(**m).content.split()) for m in messages),
                     "completion_tokens": 50,
-                    "total_tokens": sum(len(m.content.split()) for m in request.messages) + 50
+                    "total_tokens": sum(len(ChatMessage(**m).content.split()) for m in messages) + 50
                 }
             )
+    except Exception as e:
+        logger.error(f"❌ Enqueue failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Enqueue failed: {e}")
 
+
+# ------------------------------------------------------------------------------
+# /chat/completions (Watsonx-compatible) with sync override support
+# ------------------------------------------------------------------------------
+def _payload_requests_sync(payload: Dict[str, Any]) -> bool:
+    if payload.get("mode") == "sync":
+        return True
+    orch = payload.get("orchestrate") or {}
+    if orch.get("force_sync") is True:
+        return True
+    return False
+
+
+def _ua_requests_sync(user_agent: str) -> bool:
+    if not FORCE_SYNC_FOR_UA_SUBSTR:
+        return False
+    return FORCE_SYNC_FOR_UA_SUBSTR.lower() in (user_agent or "").lower()
+
+
+@app.post("/chat/completions")
+async def chat_completions(
+    req: Request,
+    background_tasks: BackgroundTasks,
+    x_force_sync: Optional[str] = Header(default=None),
+    user_agent: Optional[str] = Header(default=None, alias="User-Agent"),
+):
+    try:
+        payload = await req.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+
+    try:
+        force_sync_by_header = (ALLOW_HEADER_FORCE_SYNC and x_force_sync == "1")
+        force_sync = (
+            force_sync_by_header
+            or _payload_requests_sync(payload)
+            or _ua_requests_sync(user_agent or "")
+        )
+
+        if force_sync:
+            logger.info("SYNC path engaged", extra={"marker": "sync"})
+            result = await process_immediately(payload)
+            return result
+
+        # Default async path
+        return await enqueue_job(payload, background_tasks)
     except Exception as e:
         logger.error(f"❌ Watson X chat completions failed: {e}")
 
         error_response = ChatCompletionResponse(
             id=f"chatcmpl-error-{uuid.uuid4()}",
             created=int(datetime.now().timestamp()),
-            model="stock-analysis-agent",
+            model=str((payload or {}).get("model", "stock-analysis-agent")),
             choices=[{
                 "index": 0,
                 "message": {
@@ -480,7 +573,7 @@ async def chat_completions(request: ChatCompletionRequest, background_tasks: Bac
             usage={"prompt_tokens": 0, "completion_tokens": 30, "total_tokens": 30}
         )
 
-        if request.stream:
+        if (payload or {}).get("stream", False):
             async def error_stream():
                 chunk = {
                     "id": error_response.id,
@@ -495,6 +588,18 @@ async def chat_completions(request: ChatCompletionRequest, background_tasks: Bac
             return StreamingResponse(error_stream(), media_type="text/event-stream")
         else:
             return error_response
+
+
+@app.post("/chat/completions/sync")
+async def chat_completions_sync(req: Request):
+    try:
+        payload = await req.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+
+    logger.info("SYNC path via /sync endpoint", extra={"marker": "sync"})
+    result = await process_immediately(payload)
+    return result
 
 # ------------------------------------------------------------------------------
 # Health + Legacy
@@ -542,6 +647,10 @@ async def health_check():
             "environment": os.environ.get("ENVIRONMENT", "production")
         }
     }
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
 
 @app.post("/analyze", response_model=StockAnalysisResponse)
 async def analyze_stock(request: StockAnalysisRequest, background_tasks: BackgroundTasks):
