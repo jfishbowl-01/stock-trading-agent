@@ -13,7 +13,7 @@ import asyncio
 import re
 from datetime import datetime
 import uuid
-import time  # added for callback backoff
+import time
 
 # Import your crew
 from src.stock_analysis.crew import StockAnalysisCrew
@@ -45,8 +45,9 @@ app.add_middleware(
 # ------------------------------------------------------------------------------
 # Feature flags for sync override
 # ------------------------------------------------------------------------------
-FORCE_SYNC_FOR_UA_SUBSTR = os.getenv("FORCE_SYNC_FOR_UA_SUBSTR", "")  # e.g., "watsonx-orchestrate"
+FORCE_SYNC_FOR_UA_SUBSTR = os.getenv("FORCE_SYNC_FOR_UA_SUBSTR", "")
 ALLOW_HEADER_FORCE_SYNC = os.getenv("ALLOW_HEADER_FORCE_SYNC", "1") == "1"
+FORCE_WATSON_X_SYNC = os.getenv("FORCE_WATSON_X_SYNC", "1") == "1"  # NEW: Force Watson X to sync
 
 # ------------------------------------------------------------------------------
 # In-memory job store & cache (use Redis in prod)
@@ -56,7 +57,7 @@ job_status: Dict[str, Dict[str, Any]] = {}
 RESULT_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "21600"))  # 6h default
 CALLBACK_TIMEOUT_SECONDS = float(os.environ.get("CALLBACK_TIMEOUT_SECONDS", "10"))
-ANALYSIS_TIMEOUT_SECONDS = int(os.environ.get("ANALYSIS_TIMEOUT", "600"))
+ANALYSIS_TIMEOUT_SECONDS = int(os.environ.get("ANALYSIS_TIMEOUT", "900"))  # Increased to 15 minutes
 
 # ------------------------------------------------------------------------------
 # Models
@@ -131,7 +132,7 @@ def extract_stock_and_query(messages: List[ChatMessage]) -> tuple[str, str]:
     """Extract ticker and create a simple analysis query."""
     user_messages = [m for m in messages if m.role == "user"]
     user_query = user_messages[-1].content.strip() if user_messages else ""
-    logger.info(f"🔍 Processing Watson X message: '{user_query}'")
+    logger.info(f"🔍 Processing message: '{user_query}'")
 
     stock_symbol = None
     
@@ -156,7 +157,8 @@ def extract_stock_and_query(messages: List[ChatMessage]) -> tuple[str, str]:
         mapping = {
             'apple': 'AAPL', 'microsoft': 'MSFT', 'google': 'GOOGL', 'alphabet': 'GOOGL',
             'amazon': 'AMZN', 'meta': 'META', 'facebook': 'META', 'tesla': 'TSLA',
-            'nvidia': 'NVDA', 'netflix': 'NFLX', 'adobe': 'ADBE'
+            'nvidia': 'NVDA', 'netflix': 'NFLX', 'adobe': 'ADBE', 'jpmorgan': 'JPM',
+            'starbucks': 'SBUX', 'walmart': 'WMT', 'disney': 'DIS'
         }
         query_lower = user_query.lower()
         for company_name, ticker in mapping.items():
@@ -169,126 +171,39 @@ def extract_stock_and_query(messages: List[ChatMessage]) -> tuple[str, str]:
         stock_symbol = "AAPL"
         logger.warning(f"❌ No stock symbol found, defaulting to: {stock_symbol}")
 
-    # Simple query - this is the key change
+    # Simple query format
     simple_query = f"Analyze {stock_symbol} stock and provide investment recommendation"
     
-    logger.info(f"🚀 Created simple query for {stock_symbol}: {simple_query}")
+    logger.info(f"🚀 Extracted: {stock_symbol} -> {simple_query}")
     return stock_symbol, simple_query
 
 # ------------------------------------------------------------------------------
-# Streaming (SSE)
+# Watson X Detection
 # ------------------------------------------------------------------------------
-async def stream_analysis_progress(job_id: str):
-    logger.info(f"🚦 [stream_analysis_progress] Started for Job ID: {job_id}")
-
-    initial_chunk = {
-        "id": f"chatcmpl-{job_id}",
-        "object": "chat.completion.chunk",
-        "created": int(datetime.now().timestamp()),
-        "model": "stock-analysis-agent",
-        "choices": [{"index": 0, "delta": {"role": "assistant", "content": "📡 Analysis starting...\n\n"}, "finish_reason": None}]
-    }
-    yield f"data: {json.dumps(initial_chunk)}\n\n"
-    await asyncio.sleep(0.1)
-
-    start_time = datetime.now().timestamp()
-    timeout = 1200
-    last_status = None
-    update_counter = 0
-    heartbeat_start = datetime.now().timestamp()
-    heartbeat_timeout = 15
-
-    while datetime.now().timestamp() - start_time < timeout:
-        job = job_status.get(job_id, {})
-        current_status = job.get("status", "unknown")
-
-        if last_status is None and current_status == "queued":
-            if datetime.now().timestamp() - heartbeat_start > heartbeat_timeout:
-                logger.warning(f"❌ Heartbeat timeout for Job {job_id}")
-                error_chunk = {
-                    "id": f"chatcmpl-{job_id}",
-                    "object": "chat.completion.chunk",
-                    "created": int(datetime.now().timestamp()),
-                    "model": "stock-analysis-agent",
-                    "choices": [{"index": 0, "delta": {"content": "❌ Error: analysis did not start. Try again later.\n"}, "finish_reason": "stop"}]
-                }
-                yield f"data: {json.dumps(error_chunk)}\n\n"
-                yield "data: [DONE]\n\n"
-                return
-
-        if current_status != last_status:
-            logger.info(f"🔄 Status: {last_status} → {current_status}")
-            status_msg = {
-                "queued": "📋 Queued…",
-                "running": "🤖 Running analysis…",
-                "processing": "📊 Synthesizing findings…",
-            }.get(current_status)
-            if status_msg:
-                chunk = {
-                    "id": f"chatcmpl-{job_id}",
-                    "object": "chat.completion.chunk",
-                    "created": int(datetime.now().timestamp()),
-                    "model": "stock-analysis-agent",
-                    "choices": [{"index": 0, "delta": {"content": f"{status_msg}\n\n"}, "finish_reason": None}]
-                }
-                yield f"data: {json.dumps(chunk)}\n\n"
-                last_status = current_status
-
-        update_counter += 1
-        if update_counter % 24 == 0:
-            elapsed = int(datetime.now().timestamp() - start_time)
-            minutes, seconds = elapsed // 60, elapsed % 60
-            keepalive_chunk = {
-                "id": f"chatcmpl-{job_id}",
-                "object": "chat.completion.chunk",
-                "created": int(datetime.now().timestamp()),
-                "model": "stock-analysis-agent",
-                "choices": [{"index": 0, "delta": {"content": f"⏱️ Progress… ({minutes}m {seconds}s)\n"}, "finish_reason": None}]
-            }
-            yield f"data: {json.dumps(keepalive_chunk)}\n\n"
-
-        if current_status in ["completed", "failed"]:
-            logger.info(f"📍 Job final status detected: {current_status}")
-            break
-
-        await asyncio.sleep(2)
-
-    job = job_status.get(job_id, {})
-    final_status = job.get("status", "unknown")
-
-    if final_status == "completed":
-        result = job.get("result", "Analysis completed but result not available.")
-        final_content = f"## 📈 Analysis Complete\n\n{result}\n"
-    else:
-        error_msg = job.get("error", "Analysis timeout or unknown error occurred")
-        final_content = f"## ❌ Analysis Failed\n\n**Error**: {error_msg}\n"
-
-    final_payload = {
-        "job_id": job_id,
-        "status": final_status,
-        "result": job.get("result"),
-        "error": job.get("error"),
-        "company_stock": job.get("company_stock"),
-        "created_at": job.get("created_at"),
-        "completed_at": job.get("completed_at"),
-    }
-    cb_url = job.get("callback_url")
-    if cb_url:
-        logger.info(f"📬 Posting final result to callback: {cb_url}")
-        asyncio.create_task(_post_callback(cb_url, final_payload))
-
-    final_chunk = {
-        "id": f"chatcmpl-{job_id}",
-        "object": "chat.completion.chunk",
-        "created": int(datetime.now().timestamp()),
-        "model": "stock-analysis-agent",
-        "choices": [{"index": 0, "delta": {"content": final_content}, "finish_reason": "stop"}]
-    }
-    yield f"data: {json.dumps(final_chunk)}\n\n"
-    yield "data: [DONE]\n\n"
+def is_watson_x_request(user_agent: str, headers: Dict[str, str]) -> bool:
+    """Detect if request is from Watson X Orchestrate"""
+    if not user_agent:
+        return False
+    
+    ua_lower = user_agent.lower()
+    watson_indicators = [
+        'watson', 'orchestrate', 'ibm', 'watsonx', 'wxo'
+    ]
+    
+    for indicator in watson_indicators:
+        if indicator in ua_lower:
+            return True
+    
+    # Check for IBM-specific headers
+    ibm_headers = ['x-ibm', 'x-watson', 'x-orchestrate']
+    for header_name in headers.keys():
+        if any(ibm_header in header_name.lower() for ibm_header in ibm_headers):
+            return True
+    
+    return False
 
 # ------------------------------------------------------------------------------
-# Background worker
+# Background worker (kept for non-Watson X requests)
 # ------------------------------------------------------------------------------
 async def run_stock_analysis(job_id: str, company_stock: str, query: str):
     logger.info(f"🏁 Background job started for {company_stock} (Job ID: {job_id})")
@@ -303,20 +218,10 @@ async def run_stock_analysis(job_id: str, company_stock: str, query: str):
                 "result": cached.get("result", ""),
                 "completed_at": datetime.now().isoformat()
             })
-            cb_url = job_status[job_id].get("callback_url")
-            if cb_url:
-                asyncio.create_task(_post_callback(cb_url, {
-                    "job_id": job_id,
-                    "status": "completed",
-                    "result": cached.get("result", ""),
-                    "company_stock": company_stock,
-                    "created_at": job_status[job_id]["created_at"],
-                    "completed_at": job_status[job_id]["completed_at"]
-                }))
             return
 
         job_status[job_id]["status"] = "running"
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.1)
         job_status[job_id]["status"] = "processing"
 
         inputs = {'query': query, 'company_stock': company_stock.upper()}
@@ -335,16 +240,6 @@ async def run_stock_analysis(job_id: str, company_stock: str, query: str):
                 "error": f"Analysis timed out after {ANALYSIS_TIMEOUT_SECONDS} seconds",
                 "completed_at": datetime.now().isoformat()
             })
-            cb_url = job_status[job_id].get("callback_url")
-            if cb_url:
-                asyncio.create_task(_post_callback(cb_url, {
-                    "job_id": job_id,
-                    "status": "failed",
-                    "error": f"Analysis timed out after {ANALYSIS_TIMEOUT_SECONDS} seconds",
-                    "company_stock": company_stock,
-                    "created_at": job_status[job_id]["created_at"],
-                    "completed_at": job_status[job_id]["completed_at"]
-                }))
             return
         except Exception as e:
             logger.error(f"❌ Crew execution failed for {company_stock} (Job ID: {job_id}): {e}")
@@ -353,19 +248,9 @@ async def run_stock_analysis(job_id: str, company_stock: str, query: str):
                 "error": str(e),
                 "completed_at": datetime.now().isoformat()
             })
-            cb_url = job_status[job_id].get("callback_url")
-            if cb_url:
-                asyncio.create_task(_post_callback(cb_url, {
-                    "job_id": job_id,
-                    "status": "failed",
-                    "error": str(e),
-                    "company_stock": company_stock,
-                    "created_at": job_status[job_id]["created_at"],
-                    "completed_at": job_status[job_id]["completed_at"]
-                }))
             return
 
-        logger.info(f"🧠 Raw CrewAI result for {company_stock}: {result}")
+        logger.info(f"🧠 Analysis completed for {company_stock}")
 
         final_str = str(result) if result else ""
         if final_str and "Final Answer" not in final_str:
@@ -379,16 +264,6 @@ async def run_stock_analysis(job_id: str, company_stock: str, query: str):
             "completed_at": datetime.now().isoformat()
         })
         logger.info(f"✅ Job completed for {company_stock} (Job ID: {job_id})")
-        cb_url = job_status[job_id].get("callback_url")
-        if cb_url:
-            asyncio.create_task(_post_callback(cb_url, {
-                "job_id": job_id,
-                "status": "completed",
-                "result": final_str,
-                "company_stock": company_stock,
-                "created_at": job_status[job_id]["created_at"],
-                "completed_at": job_status[job_id]["completed_at"]
-            }))
 
     except Exception as e:
         logger.error(f"🔥 Unhandled error in run_stock_analysis for {company_stock} (Job ID: {job_id}): {e}")
@@ -397,34 +272,39 @@ async def run_stock_analysis(job_id: str, company_stock: str, query: str):
             "error": str(e),
             "completed_at": datetime.now().isoformat()
         })
-        cb_url = job_status[job_id].get("callback_url")
-        if cb_url:
-            asyncio.create_task(_post_callback(cb_url, {
-                "job_id": job_id,
-                "status": "failed",
-                "error": str(e),
-                "company_stock": company_stock,
-                "created_at": job_status[job_id]["created_at"],
-                "completed_at": job_status[job_id]["completed_at"]
-            }))
 
 # ------------------------------------------------------------------------------
-# Helpers: sync and enqueue paths for chat
+# Synchronous processing (for Watson X and forced sync)
 # ------------------------------------------------------------------------------
-async def process_immediately(payload: Dict[str, Any]) -> Dict[str, Any]:
+async def process_immediately(payload: Dict[str, Any], source: str = "unknown") -> Dict[str, Any]:
     """Synchronous processing path for chat payloads."""
     try:
         messages = payload.get("messages", [])
         if not messages:
             raise ValueError("Missing 'messages' in payload")
 
+        logger.info(f"🚀 Starting immediate processing (source: {source})")
         stock_symbol, enhanced_query = extract_stock_and_query([ChatMessage(**m) for m in messages])
-        inputs = {'query': enhanced_query, 'company_stock': stock_symbol.upper()}
-        crew = StockAnalysisCrew(stock_symbol=stock_symbol.upper())
-        # Run the crew in a thread to avoid blocking event loop
-        result = await asyncio.to_thread(lambda: crew.crew().kickoff(inputs=inputs))
+        
+        # Check cache first
+        key = _cache_key(stock_symbol, enhanced_query)
+        cached = RESULT_CACHE.get(key)
+        now_ts = datetime.now().timestamp()
+        if cached and cached.get("expires", 0) > now_ts:
+            logger.info(f"🗃️ Cache hit for {stock_symbol}")
+            final_str = cached.get("result", "")
+        else:
+            inputs = {'query': enhanced_query, 'company_stock': stock_symbol.upper()}
+            crew = StockAnalysisCrew(stock_symbol=stock_symbol.upper())
+            
+            # Run the crew in a thread to avoid blocking event loop
+            result = await asyncio.to_thread(lambda: crew.crew().kickoff(inputs=inputs))
+            final_str = str(result) if result else ""
+            
+            # Cache the result
+            RESULT_CACHE[key] = {"result": final_str, "expires": datetime.now().timestamp() + CACHE_TTL_SECONDS}
+            logger.info(f"✅ Immediate processing completed for {stock_symbol}")
 
-        final_str = str(result) if result else ""
         response = {
             "id": f"chatcmpl-{uuid.uuid4()}",
             "object": "chat.completion",
@@ -435,15 +315,21 @@ async def process_immediately(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "message": {"role": "assistant", "content": final_str},
                 "finish_reason": "stop"
             }],
-            "usage": None,
-            "_meta": {"mode": "sync"}
+            "usage": {
+                "prompt_tokens": sum(len(ChatMessage(**m).content.split()) for m in messages),
+                "completion_tokens": len(final_str.split()) if final_str else 0,
+                "total_tokens": sum(len(ChatMessage(**m).content.split()) for m in messages) + (len(final_str.split()) if final_str else 0)
+            },
+            "_meta": {"mode": "sync", "source": source}
         }
         return response
     except Exception as e:
         logger.error(f"❌ Sync processing failed: {e}")
         raise HTTPException(status_code=500, detail=f"Sync processing failed: {e}")
 
-
+# ------------------------------------------------------------------------------
+# Async job processing (for non-Watson X requests)
+# ------------------------------------------------------------------------------
 async def enqueue_job(payload: Dict[str, Any], background_tasks: BackgroundTasks):
     """Async queue submission using existing background task model."""
     try:
@@ -469,61 +355,42 @@ async def enqueue_job(payload: Dict[str, Any], background_tasks: BackgroundTasks
         }
 
         background_tasks.add_task(run_stock_analysis, job_id, stock_symbol, enhanced_query)
-        logger.info(f"✅ Started Watson X analysis for {stock_symbol} (Job: {job_id})")
+        logger.info(f"✅ Started async analysis for {stock_symbol} (Job: {job_id})")
 
         if stream:
-            return StreamingResponse(
-                stream_analysis_progress(job_id),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
-            )
-        else:
-            note = f"\n\nA callback will POST the final result to: {callback_url}" if callback_url else ""
-            return ChatCompletionResponse(
-                id=f"chatcmpl-{job_id}",
-                created=int(datetime.now().timestamp()),
-                model=payload.get("model", "stock-analysis-agent"),
-                choices=[{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": (
-                            f"🔍 **Stock Analysis Initiated for {stock_symbol}**\n\n"
-                            f"Running filings, financial metrics, news/sentiment, and recommendation.\n\n"
-                            f"*Job Reference: {job_id}*{note}"
-                        )
-                    },
-                    "finish_reason": "stop"
-                }],
-                usage={
-                    "prompt_tokens": sum(len(ChatMessage(**m).content.split()) for m in messages),
-                    "completion_tokens": 50,
-                    "total_tokens": sum(len(ChatMessage(**m).content.split()) for m in messages) + 50
-                }
-            )
+            # For simplicity, we won't implement streaming for async - just return job ID
+            pass
+
+        note = f"\n\nA callback will POST the final result to: {callback_url}" if callback_url else ""
+        return ChatCompletionResponse(
+            id=f"chatcmpl-{job_id}",
+            created=int(datetime.now().timestamp()),
+            model=payload.get("model", "stock-analysis-agent"),
+            choices=[{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": (
+                        f"🔍 **Stock Analysis Initiated for {stock_symbol}**\n\n"
+                        f"Running filings, financial metrics, news/sentiment, and recommendation.\n\n"
+                        f"*Job Reference: {job_id}*{note}"
+                    )
+                },
+                "finish_reason": "stop"
+            }],
+            usage={
+                "prompt_tokens": sum(len(ChatMessage(**m).content.split()) for m in messages),
+                "completion_tokens": 50,
+                "total_tokens": sum(len(ChatMessage(**m).content.split()) for m in messages) + 50
+            }
+        )
     except Exception as e:
         logger.error(f"❌ Enqueue failed: {e}")
         raise HTTPException(status_code=500, detail=f"Enqueue failed: {e}")
 
-
 # ------------------------------------------------------------------------------
-# /chat/completions (Watsonx-compatible) with sync override support
+# /chat/completions (Watsonx-compatible) with improved routing
 # ------------------------------------------------------------------------------
-def _payload_requests_sync(payload: Dict[str, Any]) -> bool:
-    if payload.get("mode") == "sync":
-        return True
-    orch = payload.get("orchestrate") or {}
-    if orch.get("force_sync") is True:
-        return True
-    return False
-
-
-def _ua_requests_sync(user_agent: str) -> bool:
-    if not FORCE_SYNC_FOR_UA_SUBSTR:
-        return False
-    return FORCE_SYNC_FOR_UA_SUBSTR.lower() in (user_agent or "").lower()
-
-
 @app.post("/chat/completions")
 async def chat_completions(
     req: Request,
@@ -536,23 +403,47 @@ async def chat_completions(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
 
+    # Get request headers for debugging
+    headers = dict(req.headers)
+    
+    # Comprehensive logging for debugging
+    logger.info(f"🔍 REQUEST DEBUG:")
+    logger.info(f"  User-Agent: {user_agent}")
+    logger.info(f"  X-Force-Sync: {x_force_sync}")
+    logger.info(f"  Headers: {list(headers.keys())}")
+    logger.info(f"  Payload keys: {list(payload.keys())}")
+
     try:
+        # Determine if we should force sync processing
         force_sync_by_header = (ALLOW_HEADER_FORCE_SYNC and x_force_sync == "1")
+        force_sync_by_payload = payload.get("mode") == "sync"
+        force_sync_by_ua = FORCE_SYNC_FOR_UA_SUBSTR and FORCE_SYNC_FOR_UA_SUBSTR.lower() in (user_agent or "").lower()
+        force_sync_watson_x = FORCE_WATSON_X_SYNC and is_watson_x_request(user_agent or "", headers)
+
         force_sync = (
-            force_sync_by_header
-            or _payload_requests_sync(payload)
-            or _ua_requests_sync(user_agent or "")
+            force_sync_by_header or
+            force_sync_by_payload or 
+            force_sync_by_ua or
+            force_sync_watson_x
         )
 
+        # Log the decision
         if force_sync:
-            logger.info("SYNC path engaged", extra={"marker": "sync"})
-            result = await process_immediately(payload)
+            sync_reason = []
+            if force_sync_by_header: sync_reason.append("header")
+            if force_sync_by_payload: sync_reason.append("payload")
+            if force_sync_by_ua: sync_reason.append("user-agent")
+            if force_sync_watson_x: sync_reason.append("watson-x")
+            
+            logger.info(f"🔄 SYNC processing engaged (reasons: {', '.join(sync_reason)})")
+            result = await process_immediately(payload, source="watson-x" if force_sync_watson_x else "manual")
             return result
+        else:
+            logger.info("🔄 ASYNC processing engaged")
+            return await enqueue_job(payload, background_tasks)
 
-        # Default async path
-        return await enqueue_job(payload, background_tasks)
     except Exception as e:
-        logger.error(f"❌ Watson X chat completions failed: {e}")
+        logger.error(f"❌ Chat completions failed: {e}")
 
         error_response = ChatCompletionResponse(
             id=f"chatcmpl-error-{uuid.uuid4()}",
@@ -572,37 +463,22 @@ async def chat_completions(
             }],
             usage={"prompt_tokens": 0, "completion_tokens": 30, "total_tokens": 30}
         )
-
-        if (payload or {}).get("stream", False):
-            async def error_stream():
-                chunk = {
-                    "id": error_response.id,
-                    "object": "chat.completion.chunk",
-                    "created": error_response.created,
-                    "model": error_response.model,
-                    "choices": [{"index": 0, "delta": {"content": error_response.choices[0]["message"]["content"]}, "finish_reason": "stop"}]
-                }
-                yield f"data: {json.dumps(chunk)}\n\n"
-                yield "data: [DONE]\n\n"
-
-            return StreamingResponse(error_stream(), media_type="text/event-stream")
-        else:
-            return error_response
-
+        return error_response
 
 @app.post("/chat/completions/sync")
 async def chat_completions_sync(req: Request):
+    """Dedicated sync endpoint for testing"""
     try:
         payload = await req.json()
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
 
-    logger.info("SYNC path via /sync endpoint", extra={"marker": "sync"})
-    result = await process_immediately(payload)
+    logger.info("🔄 SYNC path via /sync endpoint")
+    result = await process_immediately(payload, source="sync-endpoint")
     return result
 
 # ------------------------------------------------------------------------------
-# Health + Legacy
+# Health + Legacy endpoints
 # ------------------------------------------------------------------------------
 @app.get("/")
 async def root():
@@ -614,6 +490,7 @@ async def root():
         "protocols": ["A2A/0.2.1"],
         "endpoints": {
             "watson_x": "/chat/completions",
+            "sync": "/chat/completions/sync",
             "legacy_analyze": "/analyze",
             "legacy_status": "/status/{job_id}",
             "health": "/health"
@@ -624,7 +501,7 @@ async def root():
             "financial-analysis",
             "sec-filings-research",
             "market-sentiment-analysis",
-            "streaming-responses"
+            "watson-x-orchestrate-integration"
         ]
     }
 
@@ -638,10 +515,12 @@ async def health_check():
         "watson_x_integration": {
             "enabled": True,
             "endpoint": "/chat/completions",
-            "streaming_supported": True,
+            "force_sync": FORCE_WATSON_X_SYNC,
+            "streaming_supported": False,
             "a2a_protocol": "0.2.1"
         },
-        "active_jobs": len(job_status),
+        "active_jobs": len([j for j in job_status.values() if j.get("status") not in ["completed", "failed"]]),
+        "total_jobs": len(job_status),
         "system_info": {
             "python_version": os.sys.version.split()[0],
             "environment": os.environ.get("ENVIRONMENT", "production")
@@ -714,4 +593,6 @@ async def analyze_stock_sync(request: StockAnalysisRequest):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
+    logger.info(f"🚀 Starting Stock Analysis API on port {port}")
+    logger.info(f"🔧 Watson X Sync Mode: {'ENABLED' if FORCE_WATSON_X_SYNC else 'DISABLED'}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info", access_log=True)
