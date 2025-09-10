@@ -29,9 +29,9 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------------------------
 app = FastAPI(
     title="Stock Analysis API",
-    description="AI-powered stock analysis using CrewAI with Watson X Orchestrate integration",
+    description="AI-powered stock analysis using CrewAI with watsonx Orchestrate integration",
     version="1.0.0",
-    openapi_version="3.0.3"  # Watson X requires OpenAPI 3.0.x
+    openapi_version="3.0.3"  # watsonx requires OpenAPI 3.0.x
 )
 
 # CORS (tighten in prod)
@@ -44,7 +44,7 @@ app.add_middleware(
 )
 
 # ------------------------------------------------------------------------------
-# Watson X Configuration
+# watsonx Configuration
 # ------------------------------------------------------------------------------
 FORCE_WATSON_X_SYNC = os.getenv("FORCE_WATSON_X_SYNC", "1") == "1"
 FORCE_SYNC_FOR_UA_SUBSTR = os.getenv("FORCE_SYNC_FOR_UA_SUBSTR", "")
@@ -82,7 +82,7 @@ class JobStatusResponse(BaseModel):
     completed_at: Optional[str] = None
     callback_url: Optional[str] = None
 
-# --- Watson X compatible chat payloads ---
+# --- watsonx compatible chat payloads ---
 class ChatMessage(BaseModel):
     role: str = Field(..., description="user | assistant | system")
     content: str = Field(..., description="Message content")
@@ -179,10 +179,10 @@ def extract_stock_and_query(messages: List[ChatMessage]) -> tuple[str, str]:
     return stock_symbol, analysis_query
 
 # ------------------------------------------------------------------------------
-# Watson X Detection
+# watsonx Detection
 # ------------------------------------------------------------------------------
 def is_watson_x_request(user_agent: str, headers: Dict[str, str]) -> bool:
-    """Detect if request is from Watson X Orchestrate"""
+    """Detect if request is from watsonx Orchestrate"""
     if not user_agent:
         return False
     
@@ -203,11 +203,56 @@ def is_watson_x_request(user_agent: str, headers: Dict[str, str]) -> bool:
     
     return False
 
+def clean_response_content(content: str) -> str:
+    """Clean response content for watsonx Orchestrate compatibility."""
+    if not content:
+        return "Analysis completed but no content was generated."
+    
+    # Remove null bytes and control characters that can break JSON
+    content = content.replace('\x00', '')
+    content = re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F-\x9F]', '', content)
+    
+    # Remove excessive whitespace
+    content = re.sub(r'\n{3,}', '\n\n', content)
+    content = re.sub(r' {2,}', ' ', content)
+    
+    # Ensure content is not empty after cleaning
+    content = content.strip()
+    if not content or len(content) < 10:
+        return "Analysis completed but content was not properly formatted."
+    
+    return content
+
+def format_watsonx_response(content: str, stock_symbol: str) -> str:
+    """Format response content specifically for watsonx Orchestrate display."""
+    
+    # Clean the content first
+    content = clean_response_content(content)
+    
+    # Add header if not present
+    if not content.startswith(f"**{stock_symbol}") and not content.startswith("✅"):
+        content = f"**Stock Analysis Complete for {stock_symbol}**\n\n{content}"
+    
+    # Ensure reasonable length for watsonx display (8000 char limit)
+    if len(content) > 8000:
+        content = content[:7500] + "\n\n[Analysis truncated for display. Full report available via direct API call.]"
+    
+    # Extract and format key sections if this is a CrewAI result
+    if "Final Answer:" in content:
+        # Extract the final answer section
+        final_answer_match = re.search(r"Final Answer:\s*(.*?)(?:\n\n|\Z)", content, re.DOTALL)
+        if final_answer_match:
+            final_answer = final_answer_match.group(1).strip()
+            if final_answer:
+                content = f"**Investment Analysis for {stock_symbol}**\n\n{final_answer}"
+    
+    return content
+
 # ------------------------------------------------------------------------------
-# Synchronous processing (for Watson X and forced sync)
+# Synchronous processing (for watsonx and forced sync)
 # ------------------------------------------------------------------------------
 async def process_immediately(payload: Dict[str, Any], source: str = "unknown") -> Dict[str, Any]:
-    """Synchronous processing path for chat payloads."""
+    """Synchronous processing path for chat payloads - optimized for watsonx Orchestrate."""
     try:
         messages = payload.get("messages", [])
         if not messages:
@@ -220,31 +265,46 @@ async def process_immediately(payload: Dict[str, Any], source: str = "unknown") 
         key = _cache_key(stock_symbol, enhanced_query)
         cached = RESULT_CACHE.get(key)
         now_ts = datetime.now().timestamp()
+        
         if cached and cached.get("expires", 0) > now_ts:
             logger.info(f"🗃️ Cache hit for {stock_symbol}")
-            final_str = cached.get("result", "")
+            raw_content = cached.get("result", "")
         else:
             inputs = {'query': enhanced_query, 'company_stock': stock_symbol.upper()}
             crew = StockAnalysisCrew(stock_symbol=stock_symbol.upper())
             
-            # Run the crew in a thread to avoid blocking event loop
+            logger.info(f"🧠 Starting CrewAI analysis for {stock_symbol}")
+            
             try:
                 result = await asyncio.wait_for(
                     asyncio.to_thread(lambda: crew.crew().kickoff(inputs=inputs)),
                     timeout=ANALYSIS_TIMEOUT_SECONDS
                 )
-                final_str = str(result) if result else ""
+                
+                if result:
+                    raw_content = str(result).strip()
+                    logger.info(f"✅ CrewAI analysis completed for {stock_symbol}, length: {len(raw_content)}")
+                else:
+                    raw_content = f"Analysis completed for {stock_symbol} but no detailed results were generated."
+                    logger.warning(f"⚠️ Empty result from CrewAI for {stock_symbol}")
                 
                 # Cache the result
-                RESULT_CACHE[key] = {"result": final_str, "expires": datetime.now().timestamp() + CACHE_TTL_SECONDS}
-                logger.info(f"✅ Immediate processing completed for {stock_symbol}")
+                RESULT_CACHE[key] = {"result": raw_content, "expires": datetime.now().timestamp() + CACHE_TTL_SECONDS}
+                
             except asyncio.TimeoutError:
                 logger.error(f"⏳ Sync analysis timed out after {ANALYSIS_TIMEOUT_SECONDS}s for {stock_symbol}")
-                final_str = f"Analysis timed out after {ANALYSIS_TIMEOUT_SECONDS} seconds. Please try again or contact support."
+                raw_content = f"Analysis for {stock_symbol} timed out after {ANALYSIS_TIMEOUT_SECONDS} seconds. The analysis was too complex for real-time processing. Please try again or use a more specific query."
             except Exception as e:
                 logger.error(f"❌ Sync analysis failed for {stock_symbol}: {e}")
-                final_str = f"Analysis failed: {str(e)}. Please try again or contact support."
+                raw_content = f"Analysis failed for {stock_symbol}: {str(e)}. Please try again or contact support."
 
+        # Format content for watsonx Orchestrate
+        formatted_content = format_watsonx_response(raw_content, stock_symbol)
+        
+        logger.info(f"📊 Final response length: {len(formatted_content)} characters")
+        logger.info(f"📊 Response preview: {formatted_content[:200]}...")
+
+        # Create watsonx-compatible response
         response = {
             "id": f"chatcmpl-{uuid.uuid4()}",
             "object": "chat.completion",
@@ -252,23 +312,56 @@ async def process_immediately(payload: Dict[str, Any], source: str = "unknown") 
             "model": payload.get("model", "stock-analysis-agent"),
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": final_str},
+                "message": {
+                    "role": "assistant", 
+                    "content": formatted_content
+                },
                 "finish_reason": "stop"
             }],
             "usage": {
                 "prompt_tokens": sum(len(ChatMessage(**m).content.split()) for m in messages),
-                "completion_tokens": len(final_str.split()) if final_str else 0,
-                "total_tokens": sum(len(ChatMessage(**m).content.split()) for m in messages) + (len(final_str.split()) if final_str else 0)
-            },
-            "_meta": {"mode": "sync", "source": source}
+                "completion_tokens": len(formatted_content.split()),
+                "total_tokens": sum(len(ChatMessage(**m).content.split()) for m in messages) + len(formatted_content.split())
+            }
         }
+        
+        # Add metadata for debugging (not visible to watsonx)
+        if source == "watson-x":
+            response["_meta"] = {
+                "mode": "sync", 
+                "source": source,
+                "stock_symbol": stock_symbol,
+                "cached": cached is not None,
+                "content_length": len(formatted_content)
+            }
+        
         return response
+        
     except Exception as e:
         logger.error(f"❌ Sync processing failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Sync processing failed: {e}")
+        
+        # Return a proper error response instead of raising HTTPException
+        error_content = f"I encountered an error during the stock analysis: {str(e)}. Please try again or contact support if this issue persists."
+        
+        error_response = {
+            "id": f"chatcmpl-error-{uuid.uuid4()}",
+            "object": "chat.completion",
+            "created": int(datetime.now().timestamp()),
+            "model": payload.get("model", "stock-analysis-agent"),
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": error_content
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 0, "completion_tokens": len(error_content.split()), "total_tokens": len(error_content.split())}
+        }
+        return error_response
 
 # ------------------------------------------------------------------------------
-# Background worker (for non-Watson X requests)
+# Background worker (for non-watsonx requests)
 # ------------------------------------------------------------------------------
 async def run_stock_analysis(job_id: str, company_stock: str, query: str):
     logger.info(f"🏁 Background job started for {company_stock} (Job ID: {job_id})")
@@ -339,7 +432,7 @@ async def run_stock_analysis(job_id: str, company_stock: str, query: str):
         })
 
 # ------------------------------------------------------------------------------
-# Async job processing (for non-Watson X requests)
+# Async job processing (for non-watsonx requests)
 # ------------------------------------------------------------------------------
 async def enqueue_job(payload: Dict[str, Any], background_tasks: BackgroundTasks):
     """Async queue submission using existing background task model."""
@@ -396,7 +489,7 @@ async def enqueue_job(payload: Dict[str, Any], background_tasks: BackgroundTasks
         raise HTTPException(status_code=500, detail=f"Enqueue failed: {e}")
 
 # ------------------------------------------------------------------------------
-# /chat/completions (Watson X compatible) with improved routing
+# /chat/completions (watsonx compatible) with improved routing
 # ------------------------------------------------------------------------------
 @app.post("/chat/completions")
 async def chat_completions(
@@ -406,9 +499,9 @@ async def chat_completions(
     user_agent: Optional[str] = Header(default=None, alias="User-Agent"),
 ):
     """
-    OpenAI-compatible chat completions endpoint with Watson X Orchestrate support.
+    OpenAI-compatible chat completions endpoint with watsonx Orchestrate support.
     
-    Automatically detects Watson X requests and routes them to synchronous processing
+    Automatically detects watsonx requests and routes them to synchronous processing
     to avoid background worker issues. Regular requests use async processing.
     """
     try:
@@ -446,7 +539,7 @@ async def chat_completions(
             if force_sync_by_header: sync_reason.append("header")
             if force_sync_by_payload: sync_reason.append("payload")
             if force_sync_by_ua: sync_reason.append("user-agent")
-            if force_sync_watson_x: sync_reason.append("watson-x")
+            if force_sync_watson_x: sync_reason.append("watsonx")
             
             logger.info(f"🔄 SYNC processing engaged (reasons: {', '.join(sync_reason)})")
             result = await process_immediately(payload, source="watson-x" if force_sync_watson_x else "manual")
@@ -467,9 +560,9 @@ async def chat_completions(
                 "message": {
                     "role": "assistant",
                     "content": (
-                        "❌ **Analysis Error**\n\n"
-                        f"I encountered an error starting the stock analysis:\n\n`{str(e)}`\n\n"
-                        "Please try again, or contact support if this issue persists."
+                        "I encountered an error starting the stock analysis. "
+                        f"Error details: {str(e)}. "
+                        "Please try again or contact support if this issue persists."
                     )
                 },
                 "finish_reason": "stop"
@@ -496,13 +589,13 @@ async def chat_completions_sync(req: Request):
 @app.get("/")
 async def root():
     return {
-        "message": "Stock Analysis API - Watson X Orchestrate Compatible",
+        "message": "Stock Analysis API - watsonx Orchestrate Compatible",
         "version": "1.0.0",
         "status": "healthy",
         "watson_x_compatible": True,
         "protocols": ["OpenAPI/3.0.3"],
         "endpoints": {
-            "watson_x": "/chat/completions",
+            "watsonx": "/chat/completions",
             "sync": "/chat/completions/sync",
             "legacy_analyze": "/analyze",
             "legacy_status": "/status/{job_id}",
@@ -514,7 +607,7 @@ async def root():
             "financial-analysis",
             "sec-filings-research",
             "market-sentiment-analysis",
-            "watson-x-orchestrate-integration"
+            "watsonx-orchestrate-integration"
         ]
     }
 
@@ -608,6 +701,6 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     logger.info(f"🚀 Starting Stock Analysis API on port {port}")
-    logger.info(f"🔧 Watson X Sync Mode: {'ENABLED' if FORCE_WATSON_X_SYNC else 'DISABLED'}")
-    logger.info(f"🔧 Watson X Auto-Detection: ENABLED")
+    logger.info(f"🔧 watsonx Sync Mode: {'ENABLED' if FORCE_WATSON_X_SYNC else 'DISABLED'}")
+    logger.info(f"🔧 watsonx Auto-Detection: ENABLED")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info", access_log=True)
