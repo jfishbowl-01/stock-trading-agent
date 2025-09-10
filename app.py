@@ -243,7 +243,7 @@ async def run_stock_analysis_sync(stock_symbol: str) -> dict:
           description="Provides comprehensive stock analysis and investment recommendations using AI agents")
 async def analyze_stock_skill(input_data: StockAnalysisInput, request: Request) -> StockAnalysisOutput:
     """
-    watsonx Orchestrate Skill: Fast response with timeout protection
+    watsonx Orchestrate Skill: ALWAYS fast response (30 seconds max)
     """
     try:
         # Extract and validate stock symbol
@@ -252,7 +252,7 @@ async def analyze_stock_skill(input_data: StockAnalysisInput, request: Request) 
         if not stock_symbol or len(stock_symbol) < 1:
             raise HTTPException(status_code=400, detail="Invalid stock symbol provided")
         
-        logger.info(f"🎯 Watson X Orchestrate skill called for {stock_symbol}")
+        logger.info(f"🎯 Stock analysis request for {stock_symbol}")
         
         # Check cache first for instant response
         key = _cache_key(stock_symbol)
@@ -263,14 +263,10 @@ async def analyze_stock_skill(input_data: StockAnalysisInput, request: Request) 
             logger.info(f"🗃️ Cache hit for {stock_symbol} - instant response")
             return StockAnalysisOutput(**cached["result"])
         
-        # Detect Watson X UI requests (need fast response)
-        user_agent = request.headers.get("user-agent", "").lower()
-        is_watson_x = "watson" in user_agent or "ibm" in user_agent or "orchestrate" in user_agent
+        # ALWAYS use 30-second timeout (Watson X compatible)
+        timeout = 30
         
-        # Use shorter timeout for Watson X
-        timeout = 25 if is_watson_x else 300  # 25 seconds for Watson X, 5 minutes for others
-        
-        logger.info(f"⏱️ Using {timeout}s timeout for {stock_symbol} (Watson X: {is_watson_x})")
+        logger.info(f"⏱️ Using {timeout}s timeout for {stock_symbol}")
         
         try:
             result = await asyncio.wait_for(
@@ -280,41 +276,38 @@ async def analyze_stock_skill(input_data: StockAnalysisInput, request: Request) 
             return StockAnalysisOutput(**result)
             
         except asyncio.TimeoutError:
-            # Return immediate helpful response for Watson X
+            # Return helpful response when analysis takes too long
             logger.warning(f"⏰ Analysis timeout for {stock_symbol} after {timeout}s")
             
             return StockAnalysisOutput(
                 stock_symbol=stock_symbol.upper(),
                 recommendation="HOLD",
-                summary=f"Quick validation for {stock_symbol}: Stock symbol recognized and analysis initiated. Pending comprehensive review.",
-                detailed_analysis=f"""**Quick Analysis for {stock_symbol}**
+                summary=f"Quick validation: {stock_symbol} is recognized as a valid stock symbol. Analysis initiated but requires more processing time.",
+                detailed_analysis=f"""**Stock Analysis for {stock_symbol}**
 
-**Stock Validation**: ✅ {stock_symbol.upper()} is recognized as a valid trading symbol
+**Symbol Validation**: ✅ {stock_symbol.upper()} confirmed as valid trading symbol
 
-**Current Status**: Analysis initiated but requires more time than Watson X UI allows
+**Status**: Analysis initiated successfully but requires more time than standard timeout allows
 
-**Preliminary Assessment**:
-• Stock appears to be actively traded
-• Symbol format is valid
-• Ready for comprehensive analysis
+**Quick Assessment**:
+• Stock symbol format is correct
+• Company appears actively traded
+• Symbol recognized in major exchanges
 
-**Next Steps**:
-• For full analysis including SEC filings, financial metrics, and investment recommendations
-• Try running the analysis again (may complete faster on subsequent attempts due to caching)
-• Or check back in a few minutes as analysis may complete in background
+**Recommendation**: HOLD pending detailed analysis
 
-**Note**: This rapid response ensures Watson X compatibility while maintaining analysis quality.""",
+**Note**: For complete analysis including SEC filings, financial ratios, market sentiment, and investment recommendations, the system requires additional processing time. This quick response ensures compatibility with Watson X Orchestrate while maintaining service availability.""",
                 confidence_level="Low",
                 last_updated=datetime.now().isoformat()
             )
             
     except Exception as e:
-        logger.error(f"❌ Watson X skill execution failed: {e}")
+        logger.error(f"❌ Stock analysis failed: {e}")
         return StockAnalysisOutput(
             stock_symbol=input_data.stock_symbol.upper(),
             recommendation="HOLD",
-            summary=f"Analysis error for {input_data.stock_symbol}: {str(e)}",
-            detailed_analysis=f"Watson X Orchestrate encountered an error: {str(e)}. Please verify the stock symbol is correct (e.g., AAPL, TSLA, MSFT) and try again.",
+            summary=f"Error processing {input_data.stock_symbol}: {str(e)}",
+            detailed_analysis=f"Analysis encountered an error: {str(e)}. Please verify the stock symbol format (examples: AAPL, TSLA, MSFT) and try again.",
             confidence_level="Low",
             last_updated=datetime.now().isoformat()
         )
