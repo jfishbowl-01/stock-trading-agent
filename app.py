@@ -28,9 +28,10 @@ logger = logging.getLogger(__name__)
 # FastAPI app
 # ------------------------------------------------------------------------------
 app = FastAPI(
-    title="Stock Analysis API - watsonx Orchestrate Compatible",
-    description="AI-powered stock analysis using CrewAI with Watson X Orchestrate A2A protocol support",
-    version="1.0.0"
+    title="Stock Analysis API",
+    description="AI-powered stock analysis using CrewAI with Watson X Orchestrate integration",
+    version="1.0.0",
+    openapi_version="3.0.3"  # Watson X requires OpenAPI 3.0.x
 )
 
 # CORS (tighten in prod)
@@ -43,11 +44,11 @@ app.add_middleware(
 )
 
 # ------------------------------------------------------------------------------
-# Feature flags for sync override
+# Watson X Configuration
 # ------------------------------------------------------------------------------
+FORCE_WATSON_X_SYNC = os.getenv("FORCE_WATSON_X_SYNC", "1") == "1"
 FORCE_SYNC_FOR_UA_SUBSTR = os.getenv("FORCE_SYNC_FOR_UA_SUBSTR", "")
 ALLOW_HEADER_FORCE_SYNC = os.getenv("ALLOW_HEADER_FORCE_SYNC", "1") == "1"
-FORCE_WATSON_X_SYNC = os.getenv("FORCE_WATSON_X_SYNC", "1") == "1"  # NEW: Force Watson X to sync
 
 # ------------------------------------------------------------------------------
 # In-memory job store & cache (use Redis in prod)
@@ -57,7 +58,7 @@ job_status: Dict[str, Dict[str, Any]] = {}
 RESULT_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "21600"))  # 6h default
 CALLBACK_TIMEOUT_SECONDS = float(os.environ.get("CALLBACK_TIMEOUT_SECONDS", "10"))
-ANALYSIS_TIMEOUT_SECONDS = int(os.environ.get("ANALYSIS_TIMEOUT", "900"))  # Increased to 15 minutes
+ANALYSIS_TIMEOUT_SECONDS = int(os.environ.get("ANALYSIS_TIMEOUT", "900"))  # 15 minutes
 
 # ------------------------------------------------------------------------------
 # Models
@@ -81,7 +82,7 @@ class JobStatusResponse(BaseModel):
     completed_at: Optional[str] = None
     callback_url: Optional[str] = None
 
-# --- Watsonx-style chat payloads ---
+# --- Watson X compatible chat payloads ---
 class ChatMessage(BaseModel):
     role: str = Field(..., description="user | assistant | system")
     content: str = Field(..., description="Message content")
@@ -111,7 +112,7 @@ def _cache_key(ticker: str, query: str) -> str:
     return f"{ticker.upper()}:{day}:{hash(query) % 10_000_000}"
 
 async def _post_callback(url: str, payload: Dict[str, Any], attempts: int = 3, timeout: float = None) -> None:
-    """Resilient async callback with small retries + logging."""
+    """Resilient async callback with retries."""
     t = timeout or CALLBACK_TIMEOUT_SECONDS
     last_err = None
     for i in range(attempts):
@@ -129,14 +130,14 @@ async def _post_callback(url: str, payload: Dict[str, Any], attempts: int = 3, t
     logger.error(f"🚨 Callback failed after {attempts} attempts to {url}: {last_err}")
 
 def extract_stock_and_query(messages: List[ChatMessage]) -> tuple[str, str]:
-    """Extract ticker and create a simple analysis query."""
+    """Extract ticker and create analysis query from chat messages."""
     user_messages = [m for m in messages if m.role == "user"]
     user_query = user_messages[-1].content.strip() if user_messages else ""
     logger.info(f"🔍 Processing message: '{user_query}'")
 
     stock_symbol = None
     
-    # Simplified ticker extraction - just the essential patterns
+    # Ticker extraction patterns
     ticker_patterns = [
         r'\$([A-Z]{1,5})\b',           # $AAPL
         r'\b([A-Z]{2,5})\b',           # GOOG, MSFT, etc.
@@ -152,7 +153,7 @@ def extract_stock_and_query(messages: List[ChatMessage]) -> tuple[str, str]:
                 stock_symbol = valid[0]
                 break
 
-    # Company name mapping - simplified list
+    # Company name mapping
     if not stock_symbol:
         mapping = {
             'apple': 'AAPL', 'microsoft': 'MSFT', 'google': 'GOOGL', 'alphabet': 'GOOGL',
@@ -171,11 +172,11 @@ def extract_stock_and_query(messages: List[ChatMessage]) -> tuple[str, str]:
         stock_symbol = "AAPL"
         logger.warning(f"❌ No stock symbol found, defaulting to: {stock_symbol}")
 
-    # Simple query format
-    simple_query = f"Analyze {stock_symbol} stock and provide investment recommendation"
+    # Create comprehensive analysis query
+    analysis_query = f"Analyze {stock_symbol} stock and provide investment recommendation"
     
-    logger.info(f"🚀 Extracted: {stock_symbol} -> {simple_query}")
-    return stock_symbol, simple_query
+    logger.info(f"🚀 Extracted: {stock_symbol} -> {analysis_query}")
+    return stock_symbol, analysis_query
 
 # ------------------------------------------------------------------------------
 # Watson X Detection
@@ -203,7 +204,71 @@ def is_watson_x_request(user_agent: str, headers: Dict[str, str]) -> bool:
     return False
 
 # ------------------------------------------------------------------------------
-# Background worker (kept for non-Watson X requests)
+# Synchronous processing (for Watson X and forced sync)
+# ------------------------------------------------------------------------------
+async def process_immediately(payload: Dict[str, Any], source: str = "unknown") -> Dict[str, Any]:
+    """Synchronous processing path for chat payloads."""
+    try:
+        messages = payload.get("messages", [])
+        if not messages:
+            raise ValueError("Missing 'messages' in payload")
+
+        logger.info(f"🚀 Starting immediate processing (source: {source})")
+        stock_symbol, enhanced_query = extract_stock_and_query([ChatMessage(**m) for m in messages])
+        
+        # Check cache first
+        key = _cache_key(stock_symbol, enhanced_query)
+        cached = RESULT_CACHE.get(key)
+        now_ts = datetime.now().timestamp()
+        if cached and cached.get("expires", 0) > now_ts:
+            logger.info(f"🗃️ Cache hit for {stock_symbol}")
+            final_str = cached.get("result", "")
+        else:
+            inputs = {'query': enhanced_query, 'company_stock': stock_symbol.upper()}
+            crew = StockAnalysisCrew(stock_symbol=stock_symbol.upper())
+            
+            # Run the crew in a thread to avoid blocking event loop
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(lambda: crew.crew().kickoff(inputs=inputs)),
+                    timeout=ANALYSIS_TIMEOUT_SECONDS
+                )
+                final_str = str(result) if result else ""
+                
+                # Cache the result
+                RESULT_CACHE[key] = {"result": final_str, "expires": datetime.now().timestamp() + CACHE_TTL_SECONDS}
+                logger.info(f"✅ Immediate processing completed for {stock_symbol}")
+            except asyncio.TimeoutError:
+                logger.error(f"⏳ Sync analysis timed out after {ANALYSIS_TIMEOUT_SECONDS}s for {stock_symbol}")
+                final_str = f"Analysis timed out after {ANALYSIS_TIMEOUT_SECONDS} seconds. Please try again or contact support."
+            except Exception as e:
+                logger.error(f"❌ Sync analysis failed for {stock_symbol}: {e}")
+                final_str = f"Analysis failed: {str(e)}. Please try again or contact support."
+
+        response = {
+            "id": f"chatcmpl-{uuid.uuid4()}",
+            "object": "chat.completion",
+            "created": int(datetime.now().timestamp()),
+            "model": payload.get("model", "stock-analysis-agent"),
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": final_str},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": sum(len(ChatMessage(**m).content.split()) for m in messages),
+                "completion_tokens": len(final_str.split()) if final_str else 0,
+                "total_tokens": sum(len(ChatMessage(**m).content.split()) for m in messages) + (len(final_str.split()) if final_str else 0)
+            },
+            "_meta": {"mode": "sync", "source": source}
+        }
+        return response
+    except Exception as e:
+        logger.error(f"❌ Sync processing failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Sync processing failed: {e}")
+
+# ------------------------------------------------------------------------------
+# Background worker (for non-Watson X requests)
 # ------------------------------------------------------------------------------
 async def run_stock_analysis(job_id: str, company_stock: str, query: str):
     logger.info(f"🏁 Background job started for {company_stock} (Job ID: {job_id})")
@@ -274,60 +339,6 @@ async def run_stock_analysis(job_id: str, company_stock: str, query: str):
         })
 
 # ------------------------------------------------------------------------------
-# Synchronous processing (for Watson X and forced sync)
-# ------------------------------------------------------------------------------
-async def process_immediately(payload: Dict[str, Any], source: str = "unknown") -> Dict[str, Any]:
-    """Synchronous processing path for chat payloads."""
-    try:
-        messages = payload.get("messages", [])
-        if not messages:
-            raise ValueError("Missing 'messages' in payload")
-
-        logger.info(f"🚀 Starting immediate processing (source: {source})")
-        stock_symbol, enhanced_query = extract_stock_and_query([ChatMessage(**m) for m in messages])
-        
-        # Check cache first
-        key = _cache_key(stock_symbol, enhanced_query)
-        cached = RESULT_CACHE.get(key)
-        now_ts = datetime.now().timestamp()
-        if cached and cached.get("expires", 0) > now_ts:
-            logger.info(f"🗃️ Cache hit for {stock_symbol}")
-            final_str = cached.get("result", "")
-        else:
-            inputs = {'query': enhanced_query, 'company_stock': stock_symbol.upper()}
-            crew = StockAnalysisCrew(stock_symbol=stock_symbol.upper())
-            
-            # Run the crew in a thread to avoid blocking event loop
-            result = await asyncio.to_thread(lambda: crew.crew().kickoff(inputs=inputs))
-            final_str = str(result) if result else ""
-            
-            # Cache the result
-            RESULT_CACHE[key] = {"result": final_str, "expires": datetime.now().timestamp() + CACHE_TTL_SECONDS}
-            logger.info(f"✅ Immediate processing completed for {stock_symbol}")
-
-        response = {
-            "id": f"chatcmpl-{uuid.uuid4()}",
-            "object": "chat.completion",
-            "created": int(datetime.now().timestamp()),
-            "model": payload.get("model", "stock-analysis-agent"),
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": final_str},
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": sum(len(ChatMessage(**m).content.split()) for m in messages),
-                "completion_tokens": len(final_str.split()) if final_str else 0,
-                "total_tokens": sum(len(ChatMessage(**m).content.split()) for m in messages) + (len(final_str.split()) if final_str else 0)
-            },
-            "_meta": {"mode": "sync", "source": source}
-        }
-        return response
-    except Exception as e:
-        logger.error(f"❌ Sync processing failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Sync processing failed: {e}")
-
-# ------------------------------------------------------------------------------
 # Async job processing (for non-Watson X requests)
 # ------------------------------------------------------------------------------
 async def enqueue_job(payload: Dict[str, Any], background_tasks: BackgroundTasks):
@@ -357,10 +368,6 @@ async def enqueue_job(payload: Dict[str, Any], background_tasks: BackgroundTasks
         background_tasks.add_task(run_stock_analysis, job_id, stock_symbol, enhanced_query)
         logger.info(f"✅ Started async analysis for {stock_symbol} (Job: {job_id})")
 
-        if stream:
-            # For simplicity, we won't implement streaming for async - just return job ID
-            pass
-
         note = f"\n\nA callback will POST the final result to: {callback_url}" if callback_url else ""
         return ChatCompletionResponse(
             id=f"chatcmpl-{job_id}",
@@ -372,7 +379,7 @@ async def enqueue_job(payload: Dict[str, Any], background_tasks: BackgroundTasks
                     "role": "assistant",
                     "content": (
                         f"🔍 **Stock Analysis Initiated for {stock_symbol}**\n\n"
-                        f"Running filings, financial metrics, news/sentiment, and recommendation.\n\n"
+                        f"Running comprehensive analysis including SEC filings, financial metrics, news sentiment, and investment recommendation.\n\n"
                         f"*Job Reference: {job_id}*{note}"
                     )
                 },
@@ -389,7 +396,7 @@ async def enqueue_job(payload: Dict[str, Any], background_tasks: BackgroundTasks
         raise HTTPException(status_code=500, detail=f"Enqueue failed: {e}")
 
 # ------------------------------------------------------------------------------
-# /chat/completions (Watsonx-compatible) with improved routing
+# /chat/completions (Watson X compatible) with improved routing
 # ------------------------------------------------------------------------------
 @app.post("/chat/completions")
 async def chat_completions(
@@ -398,6 +405,12 @@ async def chat_completions(
     x_force_sync: Optional[str] = Header(default=None),
     user_agent: Optional[str] = Header(default=None, alias="User-Agent"),
 ):
+    """
+    OpenAI-compatible chat completions endpoint with Watson X Orchestrate support.
+    
+    Automatically detects Watson X requests and routes them to synchronous processing
+    to avoid background worker issues. Regular requests use async processing.
+    """
     try:
         payload = await req.json()
     except Exception as e:
@@ -487,7 +500,7 @@ async def root():
         "version": "1.0.0",
         "status": "healthy",
         "watson_x_compatible": True,
-        "protocols": ["A2A/0.2.1"],
+        "protocols": ["OpenAPI/3.0.3"],
         "endpoints": {
             "watson_x": "/chat/completions",
             "sync": "/chat/completions/sync",
@@ -516,11 +529,12 @@ async def health_check():
             "enabled": True,
             "endpoint": "/chat/completions",
             "force_sync": FORCE_WATSON_X_SYNC,
-            "streaming_supported": False,
-            "a2a_protocol": "0.2.1"
+            "auto_detection": True,
+            "openapi_version": "3.0.3"
         },
         "active_jobs": len([j for j in job_status.values() if j.get("status") not in ["completed", "failed"]]),
         "total_jobs": len(job_status),
+        "cache_entries": len(RESULT_CACHE),
         "system_info": {
             "python_version": os.sys.version.split()[0],
             "environment": os.environ.get("ENVIRONMENT", "production")
@@ -595,4 +609,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     logger.info(f"🚀 Starting Stock Analysis API on port {port}")
     logger.info(f"🔧 Watson X Sync Mode: {'ENABLED' if FORCE_WATSON_X_SYNC else 'DISABLED'}")
+    logger.info(f"🔧 Watson X Auto-Detection: ENABLED")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info", access_log=True)
